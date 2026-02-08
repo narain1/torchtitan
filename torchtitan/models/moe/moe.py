@@ -275,7 +275,6 @@ class TokenChoiceTopKRouter(nn.Module):
             -1, self.num_expert_groups, experts_per_group
         )
         # Use optimized topk with dynamic indices dtype to reduce memory usage
-        
         # For the first topk (top2 in each group)
         indices_dtype_2 = _indices_dtype_by_sort_size(experts_per_group)
         top2_indices = torch.empty(
@@ -291,7 +290,6 @@ class TokenChoiceTopKRouter(nn.Module):
         torch.topk(scores_grouped, 2, dim=-1, out=(top2_scores_in_group, top2_indices))
         
         group_scores = top2_scores_in_group.sum(dim=-1)
-        
         # For the second topk (selecting limited groups)
         indices_dtype_groups = _indices_dtype_by_sort_size(self.num_expert_groups)
         group_idx = torch.empty(
@@ -352,7 +350,6 @@ class TokenChoiceTopKRouter(nn.Module):
             scores_for_choice = self._get_node_limited_routing_scores(scores_for_choice)
         
         # Use optimized topk with dynamic indices dtype to reduce memory usage
-        
         indices_dtype = _indices_dtype_by_sort_size(self.num_experts)
         selected_experts_indices = torch.empty(
             scores_for_choice.shape[:-1] + (self.top_k,),
@@ -448,10 +445,8 @@ class TokenReorderer(nn.Module):
         # Reorder the token indices to match the order of the experts
         # token_indices_experts_sorted shape (bs*slen*top_k,)
         # Use optimized argsort with dynamic indices dtype to reduce memory usage
-        
         flattened_indices = selected_experts_indices.view(-1)
         indices_dtype = _indices_dtype_by_sort_size(flattened_indices.numel())
-        
         # Pre-allocate indices tensor with optimal dtype
         token_indices_experts_sorted = torch.empty(
             flattened_indices.shape,

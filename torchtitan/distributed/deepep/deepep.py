@@ -346,9 +346,7 @@ def _permute_tokens(
 
     # Repeat each token by its valid count and select tokens in expert order
     # Use optimized argsort with dynamic indices dtype to reduce memory usage
-    
     indices_dtype = _indices_dtype_by_sort_size(valid_expert_ids.numel())
-    
     # Pre-allocate indices tensor with optimal dtype
     sort_order = torch.empty(
         valid_expert_ids.shape,
