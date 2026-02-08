@@ -282,6 +282,7 @@ class TokenChoiceTopKRouter(nn.Module):
             dtype=indices_dtype_2,
             device=scores_grouped.device
         )
+        # Note: out-variant topk requires pre-allocating both values and indices tensors
         top2_scores_in_group = torch.empty(
             scores_grouped.shape[:-1] + (2,),
             dtype=scores_grouped.dtype,
@@ -297,6 +298,7 @@ class TokenChoiceTopKRouter(nn.Module):
             dtype=indices_dtype_groups,
             device=group_scores.device
         )
+        # Note: out-variant topk requires pre-allocating both values and indices tensors
         group_values = torch.empty(
             group_scores.shape[:-1] + (self.num_limited_groups,),
             dtype=group_scores.dtype,
@@ -356,6 +358,7 @@ class TokenChoiceTopKRouter(nn.Module):
             dtype=indices_dtype,
             device=scores_for_choice.device
         )
+        # Note: out-variant topk requires pre-allocating both values and indices tensors
         selected_experts_values = torch.empty(
             scores_for_choice.shape[:-1] + (self.top_k,),
             dtype=scores_for_choice.dtype,
