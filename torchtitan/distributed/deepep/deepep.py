@@ -17,6 +17,8 @@ from typing import Optional, Tuple
 import torch
 from torch.distributed import ProcessGroup
 
+from torchtitan.models.moe.utils import _indices_dtype_by_sort_size
+
 try:
     from deep_ep import Buffer  # pyrefly: ignore[missing-import]
     from deep_ep.utils import (  # pyrefly: ignore[missing-import]
@@ -344,7 +346,6 @@ def _permute_tokens(
 
     # Repeat each token by its valid count and select tokens in expert order
     # Use optimized argsort with dynamic indices dtype to reduce memory usage
-    from torchtitan.models.moe.utils import _indices_dtype_by_sort_size
     
     indices_dtype = _indices_dtype_by_sort_size(valid_expert_ids.numel())
     
