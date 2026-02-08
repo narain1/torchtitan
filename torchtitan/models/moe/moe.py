@@ -13,7 +13,7 @@ from torch import nn
 from torch.distributed.tensor import DTensor
 
 from torchtitan.tools.logging import logger
-from .utils import indices_padding_wrapper
+from .utils import indices_padding_wrapper, _indices_dtype_by_sort_size
 
 
 @dataclass
@@ -274,8 +274,38 @@ class TokenChoiceTopKRouter(nn.Module):
         scores_grouped = scores_for_choice.view(
             -1, self.num_expert_groups, experts_per_group
         )
-        top2_scores_in_group, _ = scores_grouped.topk(2, dim=-1)
+        # top2_scores_in_group, _ = scores_grouped.topk(2, dim=-1)
+
+        indices_dtype_2 = _indices_dtype_by_sort_size(experts_per_group)
+        top2_indices = torch.empty(
+            scores_grouped.shape[:-1] + (2,),
+            dtype=indices_dtype_2,
+            device=scores_grouped.device
+        )
+        top2_scores_in_group = torch.empty(
+            scores_grouped.shape[:-1] + (2,),
+            dtype=scores_grouped.dtype,
+            device=scores_grouped.device
+        )
+        torch.topk(scores_grouped, 2, dim=-1, out=(top2_scores_in_group, top2_indices))
+
         group_scores = top2_scores_in_group.sum(dim=-1)
+        # For the second topk (selecting limited groups)
+        indices_dtype_groups = _indices_dtype_by_sort_size(self.num_expert_groups)
+        group_idx = torch.empty(
+            group_scores.shape[:-1] + (self.num_limited_groups,),
+            dtype=indices_dtype_groups,
+            device=group_scores.device
+        )
+        group_values = torch.empty(
+            group_scores.shape[:-1] + (self.num_limited_groups,),
+            dtype=group_scores.dtype,
+            device=group_scores.device
+        )
+        torch.topk(
+            group_scores, k=self.num_limited_groups, dim=-1, sorted=False,
+            out=(group_values, group_idx)
+        )
         _, group_idx = torch.topk(
             group_scores, k=self.num_limited_groups, dim=-1, sorted=False
         )
@@ -321,8 +351,21 @@ class TokenChoiceTopKRouter(nn.Module):
         # Apply node-limited routing if configured
         if self.num_expert_groups is not None:
             scores_for_choice = self._get_node_limited_routing_scores(scores_for_choice)
-        _, selected_experts_indices = torch.topk(
-            scores_for_choice, k=self.top_k, dim=-1, sorted=False
+
+        indices_dtype = _indices_dtype_by_sort_size(self.num_experts)
+        selected_experts_indices = torch.empty(
+            scores_for_choice.shape[:-1] + (self.top_k,),
+            dtype=indices_dtype,
+            device=scores_for_choice.device
+        )
+        selected_experts_values = torch.empty(
+            scores_for_choice.shape[:-1] + (self.top_k,),
+            dtype=scores_for_choice.dtype,
+            device=scores_for_choice.device
+        )
+        torch.topk(
+            scores_for_choice, k=self.top_k, dim=-1, sorted=False,
+            out=(selected_experts_values, selected_experts_indices)
         )
 
         # top scores shape (bs*slen, top_k)
@@ -403,8 +446,20 @@ class TokenReorderer(nn.Module):
 
         # Reorder the token indices to match the order of the experts
         # token_indices_experts_sorted shape (bs*slen*top_k,)
-        token_indices_experts_sorted = torch.argsort(
-            selected_experts_indices.view(-1), stable=True
+        # Use optimized argsort with dynamic indices dtype to reduce memory usage
+        flattened_indices = selected_experts_indices.view(-1)
+        indices_dtype = _indices_dtype_by_sort_size(flattened_indices.numel())
+        # Pre-allocate indices tensor with optimal dtype
+        token_indices_experts_sorted = torch.empty(
+            flattened_indices.shape,
+            dtype=indices_dtype,
+            device=flattened_indices.device
+        )
+        # Use out-variant argsort to leverage the smaller dtype
+        torch.argsort(
+            flattened_indices,
+            stable=True,
+            out=token_indices_experts_sorted
         )
 
         top_scores_experts_sorted = top_scores.view(-1)[token_indices_experts_sorted]

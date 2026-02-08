@@ -16,6 +16,7 @@ from typing import Optional, Tuple
 
 import torch
 from torch.distributed import ProcessGroup
+from torchtitan.models.moe_utils import _indices_dtype_by_sort_size
 
 try:
     from deep_ep import Buffer  # pyrefly: ignore[missing-import]
@@ -343,7 +344,15 @@ def _permute_tokens(
     valid_scores = dispatched_scores[mask]
 
     # Repeat each token by its valid count and select tokens in expert order
-    sort_order = torch.argsort(valid_expert_ids, stable=True)
+    indices_dtype = _indices_dtype_by_sort_size(valid_expert_ids.numel())
+    sort_order = torch.empty(
+        valid_expert_ids.shape,
+        dtype=indices_dtype,
+        device=valid_expert_ids.device
+    )
+    
+    torch.argsort(valid_expert_ids, stable=True, out=sort_order)
+
     permuted_indices = torch.arange(
         len(hidden_states), device=hidden_states.device
     ).repeat_interleave(mask.sum(dim=1))[sort_order]

@@ -95,3 +95,25 @@ def indices_padding_wrapper(func: Callable) -> Callable:
         return out
 
     return wrapper
+
+def _indices_dtype_by_sort_size(size: int) -> torch.dtype:
+    """
+    Determine optimal indices dtype based on tensor size to reduce memory usage.
+
+    This uses smaller integer dtypes for indices when possible, reducing memory
+    bandwidth and peak memory footprint during sorting operations.
+
+    Args:
+        size (int): Size of the tensor to be sorted
+
+    Returns:
+        torch.dtype: Optimal dtype for indices (uint8, uint16, uint32, or int64)
+    """
+    if size <= 255:
+        return torch.uint8
+    elif size <= 65535:
+        return torch.uint16
+    elif size <= 4294967295:
+        return torch.uint32
+    else:
+        return torch.int64
