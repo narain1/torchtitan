@@ -206,3 +206,34 @@ Here's a typical comparison setup (maintaining an overall DP degree of 4):
 To reproduce loss curves across above runs, you'll need to create a seed checkpoint, and then load the same seed checkpoint for all runs to ensure consistent model initialization on each rank. You might also need to set the `deterministic` mode to ensure consistent training behavior.
 
 We also provided an example of verifying the numerical consistency across parallelism plans configs on Llama 3 in https://github.com/pytorch/torchtitan/blob/main/docs/converging.md.
+
+### Loss Comparison with Tolerance
+
+When comparing losses across different training configurations (e.g., FSDP vs HSDP, different parallelism strategies), exact floating-point equality is often not achievable due to:
+
+1. **Different reduction orders**: Distributed training with different parallelism strategies may reduce tensors in different orders, leading to small numerical differences due to IEEE 754 floating-point arithmetic
+2. **Hardware-specific precision**: Different GPU architectures (CUDA vs ROCm) have different numerical precision characteristics
+3. **Optimization variations**: Different parallelism strategies may use different communication patterns or optimizations
+
+The `loss_compare.py` script provides `--rtol` (relative tolerance) and `--atol` (absolute tolerance) flags to handle these expected numerical differences:
+
+```bash
+# Example: Compare FSDP vs HSDP with tolerance
+python3 scripts/loss_compare.py . . \
+  --baseline-options='--parallelism.data_parallel_replicate_degree=1' \
+  --test-options='--parallelism.data_parallel_replicate_degree=4' \
+  --assert-equal --steps=10 \
+  --rtol=1e-7 --atol=1e-9
+```
+
+**Tolerance Formula**: Two loss values `a` and `b` are considered equal if:
+```
+abs(a - b) <= max(rtol * max(abs(a), abs(b)), atol)
+```
+
+**Recommended Tolerances**:
+- **CUDA GPUs**: `--rtol=1e-7 --atol=1e-9` (tighter tolerance for better precision)
+- **ROCm GPUs**: `--rtol=1e-6 --atol=1e-8` (slightly relaxed for architecture differences)
+- **Cross-architecture**: Use larger tolerances or compare within the same architecture
+
+**Note**: When `--rtol=0.0` and `--atol=0.0` (default), the script uses exact equality for backward compatibility. Always start with tight tolerances and relax only if needed.
