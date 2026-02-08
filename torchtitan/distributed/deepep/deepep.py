@@ -343,7 +343,20 @@ def _permute_tokens(
     valid_scores = dispatched_scores[mask]
 
     # Repeat each token by its valid count and select tokens in expert order
-    sort_order = torch.argsort(valid_expert_ids, stable=True)
+    # Use optimized argsort with dynamic indices dtype to reduce memory usage
+    from torchtitan.models.moe.utils import _indices_dtype_by_sort_size
+    
+    indices_dtype = _indices_dtype_by_sort_size(valid_expert_ids.numel())
+    
+    # Pre-allocate indices tensor with optimal dtype
+    sort_order = torch.empty(
+        valid_expert_ids.shape,
+        dtype=indices_dtype,
+        device=valid_expert_ids.device
+    )
+    # Use out-variant argsort to leverage the smaller dtype
+    torch.argsort(valid_expert_ids, stable=True, out=sort_order)
+    
     permuted_indices = torch.arange(
         len(hidden_states), device=hidden_states.device
     ).repeat_interleave(mask.sum(dim=1))[sort_order]
