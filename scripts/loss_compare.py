@@ -59,6 +59,18 @@ Example usages:
 10. Run baseline with specific options and export the losses:
     loss_compare.py . . --baseline-options='--parallelism.dp=2' \
         --export-result=my_config_losses.txt
+
+11. Compare with relative tolerance (useful for distributed training):
+    loss_compare.py . . --assert-equal \
+        --baseline-options='--parallelism.dp=1' \
+        --test-options='--parallelism.dp=4' \
+        --rtol=1e-5 --atol=1e-7
+
+12. Compare FSDP vs HSDP with tolerance for numerical differences:
+    loss_compare.py . . --assert-equal \
+        --baseline-options='--parallelism.data_parallel_replicate_degree=1' \
+        --test-options='--parallelism.data_parallel_replicate_degree=4' \
+        --rtol=1e-6 --steps=10
 """
 
 import argparse
@@ -694,6 +706,8 @@ def assert_losses_equal(
     baseline_log: str,
     test_log: str | None = None,
     import_result: str | None = None,
+    rtol: float = 0.0,
+    atol: float = 0.0,
 ) -> None:
     """Assert that losses are equal between baseline and test using unittest.
 
@@ -702,8 +716,15 @@ def assert_losses_equal(
         test_log: Path to test training log file. If None, only compares
             baseline against imported losses (baseline-only mode).
         import_result: Path to imported losses file for comparison.
+        rtol: Relative tolerance for comparison (default: 0.0 for exact match).
+        atol: Absolute tolerance for comparison (default: 0.0 for exact match).
 
     In baseline-only mode (test_log is None), import_result must be provided.
+    
+    Tolerance behavior:
+        - If both rtol and atol are 0.0 (default), uses exact equality check
+        - Otherwise, losses are considered equal if:
+          abs(a - b) <= max(rtol * max(abs(a), abs(b)), atol)
     """
     log_print("Asserting losses are equal...")
     log_print(f"Baseline log: {baseline_log}")
@@ -713,6 +734,12 @@ def assert_losses_equal(
         log_print("Test log: None (baseline-only mode)")
     if import_result:
         log_print(f"Import file: {import_result}")
+    
+    # Log tolerance settings
+    if rtol > 0.0 or atol > 0.0:
+        log_print(f"Using tolerance: rtol={rtol}, atol={atol}")
+    else:
+        log_print("Using exact equality (rtol=0.0, atol=0.0)")
 
     # Validate baseline-only mode has import_result
     if test_log is None and import_result is None:
@@ -777,22 +804,50 @@ def assert_losses_equal(
                 # Compare baseline vs test (if test exists)
                 if test_losses is not None:
                     test_loss = test_losses[step]
-                    self.assertEqual(
-                        baseline_loss,
-                        test_loss,
-                        f"Loss mismatch at step {step}: "
-                        f"baseline={baseline_loss}, test={test_loss}",
-                    )
+                    if rtol == 0.0 and atol == 0.0:
+                        # Use exact equality for backward compatibility
+                        self.assertEqual(
+                            baseline_loss,
+                            test_loss,
+                            f"Loss mismatch at step {step}: "
+                            f"baseline={baseline_loss}, test={test_loss}",
+                        )
+                    else:
+                        # Use tolerance-based comparison
+                        diff = abs(baseline_loss - test_loss)
+                        threshold = max(rtol * max(abs(baseline_loss), abs(test_loss)), atol)
+                        self.assertLessEqual(
+                            diff,
+                            threshold,
+                            f"Loss mismatch at step {step}: "
+                            f"baseline={baseline_loss}, test={test_loss}, "
+                            f"diff={diff}, threshold={threshold} "
+                            f"(rtol={rtol}, atol={atol})",
+                        )
 
                 # Compare baseline vs imported (if provided)
                 if imported_losses:
                     imported_loss = imported_losses[step]
-                    self.assertEqual(
-                        baseline_loss,
-                        imported_loss,
-                        f"Loss mismatch at step {step}: "
-                        f"baseline={baseline_loss}, imported={imported_loss}",
-                    )
+                    if rtol == 0.0 and atol == 0.0:
+                        # Use exact equality for backward compatibility
+                        self.assertEqual(
+                            baseline_loss,
+                            imported_loss,
+                            f"Loss mismatch at step {step}: "
+                            f"baseline={baseline_loss}, imported={imported_loss}",
+                        )
+                    else:
+                        # Use tolerance-based comparison
+                        diff = abs(baseline_loss - imported_loss)
+                        threshold = max(rtol * max(abs(baseline_loss), abs(imported_loss)), atol)
+                        self.assertLessEqual(
+                            diff,
+                            threshold,
+                            f"Loss mismatch at step {step}: "
+                            f"baseline={baseline_loss}, imported={imported_loss}, "
+                            f"diff={diff}, threshold={threshold} "
+                            f"(rtol={rtol}, atol={atol})",
+                        )
 
     # Run the test
     suite = unittest.TestLoader().loadTestsFromTestCase(LossEqualityTest)
@@ -1002,6 +1057,26 @@ Examples:
         default=8,
         help="Number of GPUs for test run (default: 8)",
     )
+    parser.add_argument(
+        "--rtol",
+        type=float,
+        default=0.0,
+        help=(
+            "Relative tolerance for loss comparison (default: 0.0 for exact match). "
+            "Used with --assert-equal. Loss values are considered equal if "
+            "abs(a - b) <= max(rtol * max(abs(a), abs(b)), atol)"
+        ),
+    )
+    parser.add_argument(
+        "--atol",
+        type=float,
+        default=0.0,
+        help=(
+            "Absolute tolerance for loss comparison (default: 0.0 for exact match). "
+            "Used with --assert-equal. Loss values are considered equal if "
+            "abs(a - b) <= max(rtol * max(abs(a), abs(b)), atol)"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1165,7 +1240,9 @@ def main() -> None:
         # Assert losses are equal if requested
         if args.assert_equal:
             # Pass test_log (None in baseline-only mode) and import_result
-            assert_losses_equal(baseline_log, test_log, args.import_result)
+            assert_losses_equal(
+                baseline_log, test_log, args.import_result, args.rtol, args.atol
+            )
 
             # Export losses if requested (only after assertion passes)
             if args.export_result:
