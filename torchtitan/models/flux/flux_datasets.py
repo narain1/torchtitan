@@ -4,35 +4,47 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import itertools
+import logging
 import math
-from dataclasses import asdict
-from typing import Any, Callable, Optional
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from typing import Annotated, Any, NotRequired, TypedDict
 
+import grain.python as grain
 import numpy as np
 import PIL.Image
-
 import torch
-from datasets import Dataset, load_dataset
-from datasets.distributed import split_dataset_by_node
+import tyro
+from torch.utils.data import default_collate
 
-from torch.distributed.checkpoint.stateful import Stateful
+from torchtitan.components.data.collators import Collator, TrainerBatch
+from torchtitan.components.data.dataset import (
+    DatasetConfig as GrainDatasetConfig,
+    SampleProcessor,
+    SingleDatasetConfig,
+)
+from torchtitan.components.data.sources import HuggingFaceStreamingSource
+from torchtitan.components.data.types import DatasetBuildContext, DatasetIterationPolicy
+from torchtitan.models.flux.tokenizer import FluxTokenizerContainer
 
-from torch.utils.data import IterableDataset
 
-from torchtitan.components.dataloader import ParallelAwareDataloader
+logger = logging.getLogger(__name__)
 
-from torchtitan.components.tokenizer import BaseTokenizer
-from torchtitan.config import JobConfig
-from torchtitan.hf_datasets import DatasetConfig
-from torchtitan.models.flux.tokenizer import build_flux_tokenizer, FluxTokenizer
-from torchtitan.tools.logging import logger
+
+class FluxSample(TypedDict):
+    t5: torch.Tensor
+    clip: torch.Tensor
+    prompt: str
+    image: torch.Tensor
+    timestep: NotRequired[float]
 
 
 def _process_cc12m_image(
     img: PIL.Image.Image,
     output_size: int = 256,
-) -> Optional[torch.Tensor]:
+    *,
+    rng: np.random.Generator,
+) -> torch.Tensor | None:
     """Process CC12M image to the desired size."""
 
     width, height = img.size
@@ -44,7 +56,7 @@ def _process_cc12m_image(
         # resize height to be equal to output_size, then crop
         new_width, new_height = math.ceil(output_size / height * width), output_size
         img = img.resize((new_width, new_height))
-        left = torch.randint(0, new_width - output_size + 1, (1,)).item()
+        left = int(rng.integers(0, new_width - output_size + 1))
         resized_img = img.crop((left, 0, left + output_size, output_size))
     else:
         # resize width to be equal to output_size, the crop
@@ -53,7 +65,7 @@ def _process_cc12m_image(
             math.ceil(output_size / width * height),
         )
         img = img.resize((new_width, new_height))
-        lower = torch.randint(0, new_height - output_size + 1, (1,)).item()
+        lower = int(rng.integers(0, new_height - output_size + 1))
         resized_img = img.crop((0, lower, output_size, lower + output_size))
 
     assert resized_img.size[0] == resized_img.size[1] == output_size
@@ -66,392 +78,239 @@ def _process_cc12m_image(
     np_img = np.array(resized_img).transpose((2, 0, 1))
     tensor_img = torch.tensor(np_img).float() / 255.0 * 2.0 - 1.0
 
-    # NOTE: The following commented code is an alternative way
-    # img_transform = transforms.Compose(
-    #     [
-    #         transforms.Resize(max(output_size, output_size)),
-    #         transforms.CenterCrop((output_size, output_size)),
-    #         transforms.ToTensor(),
-    #     ]
-    # )
-    # tensor_img = img_transform(img)
-
     return tensor_img
 
 
 def _cc12m_wds_data_processor(
     sample: dict[str, Any],
-    t5_tokenizer: FluxTokenizer,
-    clip_tokenizer: FluxTokenizer,
+    tokenizer: FluxTokenizerContainer,
     output_size: int = 256,
+    *,
+    rng: np.random.Generator,
 ) -> dict[str, Any]:
     """
     Preprocess CC12M dataset sample image and text for Flux model.
 
     Args:
         sample: A sample from dataset
-        t5_encoder: T5 encoder
-        clip_encoder: CLIP encoder
+        tokenizer: FluxTokenizerContainer that encodes text with both T5 and CLIP
         output_size: The output image size
 
     """
-    img = _process_cc12m_image(sample["jpg"], output_size=output_size)
-    t5_tokens = t5_tokenizer.encode(sample["txt"])
-    clip_tokens = clip_tokenizer.encode(sample["txt"])
+    img = _process_cc12m_image(sample["jpg"], output_size=output_size, rng=rng)
+    tokens = tokenizer.encode(sample["txt"])
 
     return {
         "image": img,
-        "clip_tokens": clip_tokens,  # type: List[int]
-        "t5_tokens": t5_tokens,  # type: List[int]
-        "prompt": sample["txt"],  # type: str
+        **tokens,
+        "prompt": sample["txt"],
     }
 
 
 def _coco_data_processor(
     sample: dict[str, Any],
-    t5_tokenizer: FluxTokenizer,
-    clip_tokenizer: FluxTokenizer,
+    tokenizer: FluxTokenizerContainer,
     output_size: int = 256,
+    *,
+    rng: np.random.Generator,
 ) -> dict[str, Any]:
     """
     Preprocess COCO dataset sample image and text for Flux model.
 
     Args:
         sample: A sample from dataset
-        t5_encoder: T5 encoder
-        clip_encoder: CLIP encoder
+        tokenizer: FluxTokenizerContainer that encodes text with both T5 and CLIP
         output_size: The output image size
 
     """
-    img = _process_cc12m_image(sample["image"], output_size=output_size)
+    img = _process_cc12m_image(sample["image"], output_size=output_size, rng=rng)
     prompt = sample["caption"]
     if isinstance(prompt, list):
         prompt = prompt[0]
-    t5_tokens = t5_tokenizer.encode(prompt)
-    clip_tokens = clip_tokenizer.encode(prompt)
+    tokens = tokenizer.encode(prompt)
 
     return {
         "image": img,
-        "clip_tokens": clip_tokens,  # type: List[int]
-        "t5_tokens": t5_tokens,  # type: List[int]
-        "prompt": prompt,  # type: str
+        **tokens,
+        "prompt": prompt,
     }
 
 
-DATASETS = {
-    "cc12m-wds": DatasetConfig(
-        path="pixparse/cc12m-wds",
-        loader=lambda path: load_dataset(path, split="train", streaming=True),
-        sample_processor=_cc12m_wds_data_processor,
-    ),
-    "cc12m-test": DatasetConfig(
-        path="tests/assets/cc12m_test",
-        loader=lambda path: load_dataset(
-            path, split="train", data_files={"train": "*.tar"}, streaming=True
+class FluxSampleProcessor(SampleProcessor):
+    """Applies an existing Flux processor and classifier-free prompt dropout."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(SampleProcessor.Config):
+        data_processor: Annotated[Callable, tyro.conf.Suppress]
+        prompt_dropout_prob: float
+        img_size: int = 256
+
+        def __post_init__(self) -> None:
+            if not 0.0 <= self.prompt_dropout_prob <= 1.0:
+                raise ValueError(
+                    "prompt_dropout_prob must be in [0, 1], "
+                    f"got {self.prompt_dropout_prob}"
+                )
+
+    def __init__(self, config: Config, *, context: DatasetBuildContext) -> None:
+        if not isinstance(context.tokenizer, FluxTokenizerContainer):
+            raise ValueError(
+                "Flux dataloader requires a FluxTokenizerContainer as tokenizer. "
+                "Set tokenizer=FluxTokenizerContainer.Config(...) in your trainer config."
+            )
+        self._tokenizer = context.tokenizer
+        empty_tokens = self._tokenizer.encode("")
+        self._t5_empty_token = empty_tokens["t5"]
+        self._clip_empty_token = empty_tokens["clip"]
+        self._data_processor = config.data_processor
+        self.prompt_dropout_prob = config.prompt_dropout_prob
+        self.img_size = config.img_size
+
+    def __call__(
+        self,
+        sample: dict[str, Any],
+        rng: np.random.Generator,
+    ) -> FluxSample | None:
+        # Use the dataset-specific preprocessor
+        sample_dict = self._data_processor(
+            sample,
+            self._tokenizer,
+            output_size=self.img_size,
+            rng=rng,
+        )
+
+        # skip low quality image or image with color channel = 1
+        if sample_dict["image"] is None:
+            sample_id = sample.get("__key__", "unknown")
+            logger.warning(
+                f"Low quality image {sample_id} is skipped in Flux Dataloader."
+            )
+            return None
+
+        # Classifier-free guidance: Replace some of the strings with empty strings.
+        dropout_prob = self.prompt_dropout_prob
+        if dropout_prob > 0.0:
+            if rng.random() < dropout_prob:
+                sample_dict["t5"] = self._t5_empty_token
+            if rng.random() < dropout_prob:
+                sample_dict["clip"] = self._clip_empty_token
+
+        return sample_dict
+
+
+class FluxCollator(Collator):
+    """Stacks Flux samples and moves images to the trainer label slot."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Collator.Config):
+        pass
+
+    def __init__(self, config: Config, *, context: DatasetBuildContext) -> None:
+        del config
+        self._num_rows_per_batch, remainder = divmod(
+            context.num_tokens_per_batch, context.max_context_length
+        )
+        if remainder or self._num_rows_per_batch == 0:
+            raise ValueError(
+                "Flux token batches must be a positive multiple of "
+                "max_context_length"
+            )
+
+    def num_rows_per_batch(self) -> int:
+        return self._num_rows_per_batch
+
+    def __call__(self, rows: Sequence[FluxSample]) -> TrainerBatch:
+        batch = default_collate(list(rows))
+        batch["labels"] = batch.pop("image")
+        return batch
+
+
+DATASETS: dict[str, SingleDatasetConfig] = {
+    "cc12m-test": SingleDatasetConfig(
+        source=HuggingFaceStreamingSource.Config(
+            path="tests/assets/cc12m_test",
+            split="train",
+            load_dataset_kwargs={
+                "data_files": {"train": "*.tar"},
+            },
         ),
-        sample_processor=_cc12m_wds_data_processor,
+        processor=FluxSampleProcessor.Config(
+            data_processor=_cc12m_wds_data_processor,
+            prompt_dropout_prob=0.447,
+        ),
+        post_filters=(lambda sample: sample is not None,),
     ),
-    "coco-validation": DatasetConfig(
-        path="howard-hou/COCO-Text",
-        loader=lambda path: load_dataset(path, split="validation", streaming=True),
-        sample_processor=_coco_data_processor,
+    "cc12m-test-validation": SingleDatasetConfig(
+        source=HuggingFaceStreamingSource.Config(
+            path="tests/assets/cc12m_test",
+            split="train",
+            load_dataset_kwargs={
+                "data_files": {"train": "*.tar"},
+            },
+        ),
+        processor=FluxSampleProcessor.Config(
+            data_processor=_cc12m_wds_data_processor,
+            prompt_dropout_prob=0.0,
+        ),
+        post_filters=(lambda sample: sample is not None,),
+    ),
+    "cc12m-wds": SingleDatasetConfig(
+        source=HuggingFaceStreamingSource.Config(
+            path="pixparse/cc12m-wds",
+            split="train",
+        ),
+        processor=FluxSampleProcessor.Config(
+            data_processor=_cc12m_wds_data_processor,
+            prompt_dropout_prob=0.447,
+        ),
+        post_filters=(lambda sample: sample is not None,),
+    ),
+    "coco-validation": SingleDatasetConfig(
+        source=HuggingFaceStreamingSource.Config(
+            path="howard-hou/COCO-Text",
+            split="validation",
+        ),
+        processor=FluxSampleProcessor.Config(
+            data_processor=_coco_data_processor,
+            prompt_dropout_prob=0.0,
+        ),
+        post_filters=(lambda sample: sample is not None,),
     ),
 }
 
 
-def _validate_dataset(
-    dataset_name: str, dataset_path: Optional[str] = None
-) -> tuple[str, Callable, Callable]:
-    """Validate dataset name and path."""
-    if dataset_name not in DATASETS:
-        raise ValueError(
-            f"Dataset {dataset_name} is not supported. "
-            f"Supported datasets are: {list(DATASETS.keys())}"
-        )
-
-    config = DATASETS[dataset_name]
-    path = dataset_path or config.path
-    logger.info(f"Preparing {dataset_name} dataset from {path}")
-    return path, config.loader, config.sample_processor
+_VALIDATION_TIMESTEPS = tuple((index + 0.5) / 8 for index in range(8))
 
 
-class FluxDataset(IterableDataset, Stateful):
-    """Dataset for FLUX text-to-image model.
+def _add_validation_timestep(
+    index: int,
+    sample: FluxSample,
+) -> FluxSample:
+    sample_with_timestep = sample.copy()
+    sample_with_timestep["timestep"] = _VALIDATION_TIMESTEPS[
+        index % len(_VALIDATION_TIMESTEPS)
+    ]
+    return sample_with_timestep
 
-    Args:
-    dataset_name (str): Name of the dataset.
-    dataset_path (str): Path to the dataset.
-    model_transform (Transform): Callable that applies model-specific preprocessing to the sample.
-    dp_rank (int): Data parallel rank.
-    dp_world_size (int): Data parallel world size.
-    infinite (bool): Whether to loop over the dataset infinitely.
-    """
 
-    def __init__(
+@dataclass(frozen=True, kw_only=True, slots=True)
+class FluxValidationDatasetConfig:
+    """Adds checkpointable round-robin validation timesteps to Flux rows."""
+
+    dataset: GrainDatasetConfig
+
+    def build(
         self,
-        dataset_name: str,
-        dataset_path: Optional[str],
-        t5_tokenizer: BaseTokenizer,
-        clip_tokenizer: BaseTokenizer,
-        job_config: Optional[JobConfig] = None,
-        dp_rank: int = 0,
-        dp_world_size: int = 1,
-        infinite: bool = False,
-    ) -> None:
-
-        # Force lowercase for consistent comparison
-        dataset_name = dataset_name.lower()
-
-        path, dataset_loader, data_processor = _validate_dataset(
-            dataset_name, dataset_path
+        *,
+        context: DatasetBuildContext,
+        dataset_iteration_policy: DatasetIterationPolicy,
+    ) -> grain.MapDataset | grain.IterDataset:
+        dataset = self.dataset.build(
+            context=context,
+            dataset_iteration_policy=dataset_iteration_policy,
         )
-        ds = dataset_loader(path)
-
-        self.dataset_name = dataset_name
-        self._data = split_dataset_by_node(ds, dp_rank, dp_world_size)
-
-        self._t5_tokenizer = t5_tokenizer
-        self._t5_empty_token = t5_tokenizer.encode("")
-        self._clip_tokenizer = clip_tokenizer
-        self._clip_empty_token = clip_tokenizer.encode("")
-        self._data_processor = data_processor
-        self.job_config = job_config
-
-        self.infinite = infinite
-
-        # Variables for checkpointing
-        self._sample_idx = 0
-        self._all_samples: list[dict[str, Any]] = []
-
-    def _get_data_iter(self):
-        if isinstance(self._data, Dataset):
-            if self._sample_idx == len(self._data):
-                return iter([])
-            else:
-                return iter(self._data.skip(self._sample_idx))
-
-        return iter(self._data)
-
-    def __iter__(self):
-        dataset_iterator = self._get_data_iter()
-        while True:
-            # TODO: Add support for robust data loading and error handling.
-            # Currently, we assume the dataset is well-formed and does not contain corrupted samples.
-            # If a corrupted sample is encountered, the program will crash and throw an exception.
-            # You can NOT try to catch the exception and continue, because the iterator within dataset
-            # is not broken after raising an exception, so calling next() will throw StopIteration and might cause re-loop.
-            try:
-                sample = next(dataset_iterator)
-            except StopIteration:
-                # We are asumming the program hits here only when reaching the end of the dataset.
-                if not self.infinite:
-                    logger.warning(
-                        f"Dataset {self.dataset_name} has run out of data. \
-                         This might cause NCCL timeout if data parallelism is enabled."
-                    )
-                    break
-                else:
-                    # Reset offset for the next iteration if infinite
-                    self._sample_idx = 0
-                    logger.warning(f"Dataset {self.dataset_name} is being re-looped.")
-                    dataset_iterator = self._get_data_iter()
-                    if not isinstance(self._data, Dataset):
-                        if hasattr(self._data, "set_epoch") and hasattr(
-                            self._data, "epoch"
-                        ):
-                            self._data.set_epoch(self._data.epoch + 1)
-                    continue
-
-            # Use the dataset-specific preprocessor
-            sample_dict = self._data_processor(
-                sample,
-                self._t5_tokenizer,
-                self._clip_tokenizer,
-                output_size=self.job_config.training.img_size,
-            )
-
-            # skip low quality image or image with color channel = 1
-            if sample_dict["image"] is None:
-                # pyrefly: ignore [missing-attribute]
-                sample = sample.get("__key__", "unknown")
-                logger.warning(
-                    f"Low quality image {sample} is skipped in Flux Dataloader."
-                )
-                continue
-
-            # Classifier-free guidance: Replace some of the strings with empty strings.
-            # Distinct random seed is initialized at the beginning of training for each FSDP rank.
-            # pyrefly: ignore [missing-attribute]
-            dropout_prob = self.job_config.training.classifier_free_guidance_prob
-            if dropout_prob > 0.0:
-                if torch.rand(1).item() < dropout_prob:
-                    sample_dict["t5_tokens"] = self._t5_empty_token
-                if torch.rand(1).item() < dropout_prob:
-                    sample_dict["clip_tokens"] = self._clip_empty_token
-
-            self._sample_idx += 1
-
-            labels = sample_dict.pop("image")
-
-            yield sample_dict, labels
-
-    def load_state_dict(self, state_dict):
-        if isinstance(self._data, Dataset):
-            self._sample_idx = state_dict["sample_idx"]
-        else:
-            assert "data" in state_dict
-            self._data.load_state_dict(state_dict["data"])
-
-    def state_dict(self):
-        if isinstance(self._data, Dataset):
-            return {"sample_idx": self._sample_idx}
-        else:
-            return {"data": self._data.state_dict()}
-
-
-def build_flux_dataloader(
-    dp_world_size: int,
-    dp_rank: int,
-    job_config: JobConfig,
-    # This parameter is not used, keep it for compatibility
-    tokenizer: FluxTokenizer | None,
-    infinite: bool = True,
-) -> ParallelAwareDataloader:
-    """Build a data loader for HuggingFace datasets.
-
-    Args:
-        dp_world_size: Data parallelism world size.
-        dp_rank: Data parallelism rank.
-        job_config: Job configuration containing dataset and DataLoader settings.
-        tokenizer: Tokenizer (kept for compatibility, not used).
-        infinite: Whether to loop the dataset infinitely.
-    """
-    dataset_name = job_config.training.dataset
-    dataset_path = job_config.training.dataset_path
-    batch_size = job_config.training.local_batch_size
-
-    t5_tokenizer, clip_tokenizer = build_flux_tokenizer(job_config)
-
-    ds = FluxDataset(
-        dataset_name=dataset_name,
-        dataset_path=dataset_path,
-        t5_tokenizer=t5_tokenizer,
-        clip_tokenizer=clip_tokenizer,
-        job_config=job_config,
-        dp_rank=dp_rank,
-        dp_world_size=dp_world_size,
-        infinite=infinite,
-    )
-
-    dataloader_kwargs = {
-        **asdict(job_config.training.dataloader),
-        "batch_size": batch_size,
-    }
-
-    return ParallelAwareDataloader(
-        dataset=ds,
-        dp_rank=dp_rank,
-        dp_world_size=dp_world_size,
-        **dataloader_kwargs,
-    )
-
-
-class FluxValidationDataset(FluxDataset):
-    """
-    Adds logic to generate timesteps for flux validation method described in SD3 paper
-
-    Args:
-    generate_timesteps (bool): Generate stratified timesteps in round-robin style for validation
-    """
-
-    def __init__(
-        self,
-        dataset_name: str,
-        dataset_path: Optional[str],
-        t5_tokenizer: BaseTokenizer,
-        clip_tokenizer: BaseTokenizer,
-        job_config: Optional[JobConfig] = None,
-        dp_rank: int = 0,
-        dp_world_size: int = 1,
-        generate_timesteps: bool = True,
-        infinite: bool = False,
-    ) -> None:
-        # Call parent constructor correctly
-        super().__init__(
-            dataset_name=dataset_name,
-            dataset_path=dataset_path,
-            t5_tokenizer=t5_tokenizer,
-            clip_tokenizer=clip_tokenizer,
-            job_config=job_config,
-            dp_rank=dp_rank,
-            dp_world_size=dp_world_size,
-            infinite=infinite,
-        )
-
-        # Initialize timestep generation for validation
-        self.generate_timesteps = generate_timesteps
-        if self.generate_timesteps:
-            # Generate stratified timesteps as described in SD3 paper
-            val_timesteps = [1 / 8 * (i + 0.5) for i in range(8)]
-            self.timestep_cycle = itertools.cycle(val_timesteps)
-
-    def __iter__(self):
-        # Get parent iterator and add timesteps to each sample
-        parent_iterator = super().__iter__()
-
-        for sample_dict, labels in parent_iterator:
-            # Add timestep to the sample dict if timestep generation is enabled
-            if self.generate_timesteps:
-                sample_dict["timestep"] = next(self.timestep_cycle)
-
-            yield sample_dict, labels
-
-
-def build_flux_validation_dataloader(
-    dp_world_size: int,
-    dp_rank: int,
-    job_config: JobConfig,
-    # This parameter is not used, keep it for compatibility
-    tokenizer: BaseTokenizer | None,
-    generate_timestamps: bool = True,
-    infinite: bool = False,
-) -> ParallelAwareDataloader:
-    """Build a validation data loader for HuggingFace datasets.
-
-    Args:
-        dp_world_size: Data parallelism world size.
-        dp_rank: Data parallelism rank.
-        job_config: Job configuration containing dataset and DataLoader settings.
-        tokenizer: Tokenizer (kept for compatibility, not used).
-        generate_timestamps: Whether to generate timesteps for validation.
-        infinite: Whether to loop the dataset infinitely.
-    """
-    dataset_name = job_config.validation.dataset
-    dataset_path = job_config.validation.dataset_path
-    batch_size = job_config.validation.local_batch_size
-
-    t5_tokenizer, clip_tokenizer = build_flux_tokenizer(job_config)
-
-    ds = FluxValidationDataset(
-        dataset_name=dataset_name,
-        dataset_path=dataset_path,
-        t5_tokenizer=t5_tokenizer,
-        clip_tokenizer=clip_tokenizer,
-        job_config=job_config,
-        dp_rank=dp_rank,
-        dp_world_size=dp_world_size,
-        generate_timesteps=generate_timestamps,
-        infinite=infinite,
-    )
-
-    dataloader_kwargs = {
-        **asdict(job_config.validation.dataloader),
-        "batch_size": batch_size,
-    }
-
-    return ParallelAwareDataloader(
-        ds,
-        dp_rank=dp_rank,
-        dp_world_size=dp_world_size,
-        **dataloader_kwargs,
-    )
+        if isinstance(dataset, grain.MapDataset):
+            # Validation cycles through eight diffusion timesteps by sample index.
+            # Convert after filtering so index gaps do not skip parts of that cycle.
+            dataset = dataset.to_iter_dataset(read_options=context.read_options)
+        return dataset.map_with_index(_add_validation_timestep)

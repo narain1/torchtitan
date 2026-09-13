@@ -6,68 +6,123 @@
 
 from abc import abstractmethod
 from dataclasses import dataclass
+from typing import Any
 
 import torch
-import torch.nn as nn
 
-from torch.nn.attention.flex_attention import BlockMask
+from torchtitan.config import Configurable, ParallelismConfig
+from torchtitan.distributed.parallel_dims import ParallelDims
 
-from torchtitan.components.tokenizer import BaseTokenizer
-
-from torchtitan.config import JobConfig
-from torchtitan.models.attention import VarlenMetadata
+from .module import Module
 
 
-AttentionMasksType = dict[str, BlockMask] | BlockMask | VarlenMetadata
+class ModelConfigConverter(Configurable):
+    """Base class for converters that transform the model config tree.
 
-
-@dataclass
-class BaseModelArgs:
-    """All ModelArgs should inherit from this class.
-
-    The only usage of this class is type checking but allows us to extend common
-    arguments to all models in the future.
+    Subclasses implement ``convert()`` to modify configs before model build
+    (e.g. quantization, LoRA).  Converters may return a replacement root
+    config when the transform needs to wrap the model config itself.
     """
 
-    _enforced: str = "This field is used to enforce all fields have defaults."
-
-    @abstractmethod
-    def update_from_config(self, job_config: JobConfig, **kwargs) -> None:
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
         pass
 
     @abstractmethod
-    def get_nparams_and_flops(self, model: nn.Module, seq_len: int) -> tuple[int, int]:
-        pass
+    def convert(self, model_config: Module.Config) -> Module.Config:
+        raise NotImplementedError
 
 
-class ModelProtocol(nn.Module):
-    """Defines the interface for a model class.
+class BaseModel(Module):
+    """Base class for all model classes.
 
-    This is used to enforce that all model classes have some methods that are
-    required by the trainer.
+    Models inherit from BaseModel (which is Module = nn.Module + Configurable).
+    Each model defines a nested Config(BaseModel.Config) with model hyperparameters.
+    The model is constructed via ``config.build()``.
 
-    NOTE: We keep protocol name for backward compatibility even though it is
-          not a Protocol anymore.
+    ``init_states`` (from Module) auto-recurses; override only for custom
+    ordering (e.g., weight tying before init).
     """
 
-    def __init__(self, model_args: BaseModelArgs) -> None:
-        super().__init__()
+    def init_weights(self, **kwargs) -> None:
+        """Backward-compatible alias for ``init_states``.
 
-    @abstractmethod
-    def init_weights(self, buffer_device: torch.device | None = None) -> None:
-        """Initialize model weights.
-
-        Args:
-            buffer_device: Optional device to place buffers on during initialization.
+        External tools (e.g., AutoParallel) wrap ``init_weights`` with
+        DTensor-aware interception. This alias ensures they can find it.
         """
-        pass
+        # TODO: remove this once autoparallel has wrap_init_states
+        buffer_device = kwargs.get("buffer_device")
+        self.init_states(buffer_device=buffer_device)
 
-    def get_attention_masks(
+    def preprocess_inputs(
         self,
-        input_batch: torch.Tensor,
-        tokenizer: BaseTokenizer,
-        extra_inputs: dict[str, torch.Tensor] | None = None,
-    ) -> AttentionMasksType:
+        input_dict: dict[str, torch.Tensor],
+        *,
+        parallel_dims: ParallelDims,
+        parallelism: ParallelismConfig,
+        max_num_documents: int | None = None,
+        max_context_length: int | None = None,
+    ) -> tuple[
+        torch.Tensor | tuple[torch.Tensor, ...],
+        torch.Tensor | tuple[torch.Tensor, ...],
+        dict[str, Any],
+    ]:
+        """Prepare the forward inputs from a dataloader batch.
+
+        Models driven by the standard trainer/validator forward path implement
+        this to build any attention masks, apply context-parallel sharding and
+        SPMD annotation as needed, and split ``input``/``labels`` out of the
+        batch. ``input_dict`` is the batch with ``labels`` folded in; return
+        ``(inputs, labels, extra_kwargs)``. Models with aligned multi-output
+        objectives may return tuples of input and label tensors.
+
+        The trainer calls this via ``cast(BaseModel, model).preprocess_inputs``,
+        so the declaration lives here for typing. There is no meaningful default:
+        models with a bespoke pipeline (e.g. Flux) never call it, and every model
+        that does must override it -- hence the ``NotImplementedError`` below.
+        """
         raise NotImplementedError(
-            "This model does not support attention masking/Flex Attention."
+            f"{type(self).__name__} must implement preprocess_inputs()."
         )
+
+    def verify_module_protocol(self) -> None:
+        """Verify all submodules satisfy the ``Module`` protocol.
+
+        Catches non-``Module`` submodules early with a clear error message,
+        preventing obscure failures when the ``Module`` protocol is being
+        used later.
+
+        Override in models where some internal ``nn.Module`` submodules
+        cannot conform to the ``Module`` protocol.
+        """
+        failures: list[tuple[str, str]] = []
+        for fqn, mod in self.named_modules():
+            if not isinstance(mod, Module):
+                failures.append((fqn, type(mod).__name__))
+        if failures:
+            details = ", ".join(f"'{fqn}' ({cls})" for fqn, cls in failures)
+            raise RuntimeError(
+                f"The following modules do not satisfy the Module protocol: {details}"
+            )
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        """Base config for all models.
+
+        Subclasses define model-specific hyperparameters.
+        """
+
+        # TODO: This function violates encapsulation;
+        # maybe replace it with config passes from outside.
+        @abstractmethod
+        def update_from_config(
+            self,
+            *,
+            config,
+            **kwargs,
+        ) -> None:
+            pass
+
+        @abstractmethod
+        def get_nparams_and_flops(self, model: Module, seq_len: int) -> tuple[int, int]:
+            pass

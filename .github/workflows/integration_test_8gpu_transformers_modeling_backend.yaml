@@ -3,12 +3,11 @@ name: Transformers Modeling Backend 8 GPU Integration Tests
 on:
   push:
     branches: [ main ]
-    tags:
-      - ciflow/8gpu/*
     paths:
       - 'torchtitan/experiments/transformers_modeling_backend/**'
       - '.github/workflows/integration_test_8gpu_transformers_modeling_backend.yaml'
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'torchtitan/experiments/transformers_modeling_backend/**'
       - '.github/workflows/integration_test_8gpu_transformers_modeling_backend.yaml'
@@ -31,7 +30,11 @@ permissions:
 jobs:
   # Step 1: Dynamically compute the matrix based on conditions
   set-matrix:
+    # Skip scheduled runs on forks, where they would only fail and email the fork owner
+    if: github.repository_owner == 'pytorch' || github.event_name != 'schedule'
     uses: ./.github/workflows/set-matrix.yaml
+    with:
+      is-experimental: true
 
   # Step 2: Use the dynamic matrix in the build-test job
   build-test:
@@ -61,9 +64,27 @@ jobs:
 
         pip config --user set global.progress_bar off
 
-        python -m pip install --force-reinstall --pre torch --index-url ${{ matrix.index-url }}
+        TORCH_SPEC="torch"
+        if [ -n "${{ matrix.torch-version }}" ]; then
+          TORCH_SPEC="torch==${{ matrix.torch-version }}"
+        fi
+        # torchvision must be installed from the nightly channel alongside torch
+        # so its C++ extensions (e.g. torchvision::nms) match the torch ABI.
+        # transformers pulls in torchvision transitively via image_utils.
+        python -m pip install --force-reinstall --pre \
+          "${TORCH_SPEC}" torchvision --index-url ${{ matrix.index-url }}
+
+        if [[ "${{ matrix.gpu-arch-type }}" == "rocm" ]]; then
+          export HIPBLASLT_TENSILE_LIBPATH="$(python -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib", "hipblaslt", "library"))')"
+          echo "HIPBLASLT_TENSILE_LIBPATH=${HIPBLASLT_TENSILE_LIBPATH}"
+        fi
 
         USE_CPP=0 python -m pip install --pre torchao --index-url ${{ matrix.index-url }}
+
+        # MoE parallelism requires transformers >= 5.0.0 (grouped experts format).
+        # Install here rather than in the shared Docker image to avoid affecting
+        # other CI workflows (e.g. unit_test_cpu tokenizer tests).
+        python -m pip install transformers==5.9.0
 
         sudo mkdir -p "$RUNNER_TEMP/artifacts-to-be-uploaded"
         sudo chown -R $(id -u):$(id -g) "$RUNNER_TEMP/artifacts-to-be-uploaded"

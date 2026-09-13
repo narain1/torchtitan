@@ -4,83 +4,121 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 import os
-from contextlib import AbstractContextManager
+from dataclasses import dataclass, field, replace
 
 import torch
 import torch.nn as nn
 from torch.distributed.pipelining.schedules import _PipelineSchedule
 
-from torchtitan.components.dataloader import BaseDataLoader
+from torchtitan.components.data import GrainDataLoader
 from torchtitan.components.loss import LossFunction
-from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.tokenizer import BaseTokenizer
-from torchtitan.components.validate import ValidationContext, Validator
-from torchtitan.config import JobConfig
-from torchtitan.distributed import ParallelDims, utils as dist_utils
-from torchtitan.models.flux.flux_datasets import build_flux_validation_dataloader
-from torchtitan.models.flux.inference.sampling import generate_image, save_image
-from torchtitan.models.flux.model.autoencoder import AutoEncoder
-from torchtitan.models.flux.model.hf_embedder import FluxEmbedder
-
-from torchtitan.models.flux.tokenizer import build_flux_tokenizer
-from torchtitan.models.flux.utils import (
-    create_position_encoding_for_latents,
-    pack_latents,
-    preprocess_data,
+from torchtitan.components.validate import (
+    iterate_and_close_dataloader,
+    ValidationContext,
+    Validator,
 )
-from torchtitan.tools.logging import logger
+from torchtitan.config import ParallelismConfig
+from torchtitan.distributed import ParallelDims, utils as dist_utils
+from torchtitan.observability.metrics import MetricsProcessor
+
+from .configs import SamplingConfig
+from .flux_datasets import FluxValidationDatasetConfig
+from .inference.sampling import generate_image, save_image
+from .model.autoencoder import AutoEncoder
+from .model.hf_embedder import FluxEmbedder
+from .tokenizer import FluxTokenizerContainer
+from .utils import create_position_encoding_for_latents, pack_latents, preprocess_data
+
+
+logger = logging.getLogger(__name__)
 
 
 class FluxValidator(Validator):
     """
-    Simple validator focused on correctness and integration.
+    Flux model validator focused on correctness and integration.
 
     Args:
-        job_config: Job configuration
-        validation_dataloader: The validation dataloader
+        config: FluxValidator.Config configuration
+        parallelism: Parallelism configuration
+        dp_world_size: Data parallel world size
+        dp_rank: Data parallel rank
+        tokenizer: Tokenizer
+        parallel_dims: Parallel dimensions
         loss_fn: Loss function to use for validation
-        model: The model to validate (single model, no parallelism)
+        validation_context: Context manager for validation
+        metrics_processor: Metrics processor
     """
 
-    validation_dataloader: BaseDataLoader
+    @dataclass(kw_only=True, slots=True)
+    class Config(Validator.Config):
+        dataloader: GrainDataLoader.Config  # pyrefly: ignore [bad-override]
+        """DataLoader configuration for Flux validation"""
+
+        all_timesteps: bool = False
+        """Generate all 8 timesteps for each sample instead of round-robin"""
+
+        save_img_count: int = -1
+        """Number of images to save during validation (-1 for unlimited)"""
+
+        save_img_folder: str = "validation_images"
+        """Folder to save validation images"""
+
+        sampling: SamplingConfig = field(default_factory=SamplingConfig)
+        """Sampling configuration for validation image generation"""
 
     def __init__(
         self,
-        job_config: JobConfig,
+        config: Config,
+        *,
+        parallelism: ParallelismConfig,
         dp_world_size: int,
         dp_rank: int,
         tokenizer: BaseTokenizer,
         parallel_dims: ParallelDims,
         loss_fn: LossFunction,
         validation_context: ValidationContext,
-        maybe_enable_amp: AbstractContextManager[None],
+        seq_len: int,
+        num_tokens_per_batch: int,
         metrics_processor: MetricsProcessor | None = None,
         pp_schedule: _PipelineSchedule | None = None,
         pp_has_first_stage: bool | None = None,
         pp_has_last_stage: bool | None = None,
+        **kwargs,
     ):
-        self.job_config = job_config
+        self.config = config
+        self.parallelism = parallelism
         self.tokenizer = tokenizer
         self.parallel_dims = parallel_dims
         self.loss_fn = loss_fn
-        # pyrefly: ignore [missing-attribute]
-        self.all_timesteps = self.job_config.validation.all_timesteps
-        self.validation_dataloader = build_flux_validation_dataloader(
-            job_config=job_config,
-            dp_world_size=dp_world_size,
-            dp_rank=dp_rank,
-            tokenizer=tokenizer,
-            generate_timestamps=not self.all_timesteps,
-            infinite=self.job_config.validation.steps != -1,
+        self.all_timesteps = config.all_timesteps
+
+        assert isinstance(tokenizer, FluxTokenizerContainer)
+
+        dataset = config.dataloader.dataset
+        if isinstance(dataset, FluxValidationDatasetConfig):
+            dataset = dataset.dataset
+        # A bounded validation run repeats data; steps=-1 consumes one finite pass.
+        self.dl_config = replace(
+            config.dataloader,
+            dataset=(
+                dataset
+                if config.all_timesteps
+                else FluxValidationDatasetConfig(dataset=dataset)
+            ),
+            repeat=config.steps != -1,
         )
+        self.dp_world_size = dp_world_size
+        self.dp_rank = dp_rank
+        self.seq_len = seq_len
+        self.num_tokens_per_batch = num_tokens_per_batch
         self.validation_context = validation_context
-        self.maybe_enable_amp = maybe_enable_amp
         # pyrefly: ignore [bad-assignment]
         self.metrics_processor = metrics_processor
-        self.t5_tokenizer, self.clip_tokenizer = build_flux_tokenizer(self.job_config)
 
-        if self.job_config.validation.steps == -1:
+        if config.steps == -1:
             logger.warning(
                 "Setting validation steps to -1 might cause hangs because of "
                 "unequal sample counts across ranks when dataset is exhausted."
@@ -93,6 +131,7 @@ class FluxValidator(Validator):
         autoencoder: AutoEncoder,
         t5_encoder: FluxEmbedder,
         clip_encoder: FluxEmbedder,
+        dump_folder: str,
     ):
         # pyrefly: ignore [read-only]
         self.device = device
@@ -100,6 +139,7 @@ class FluxValidator(Validator):
         self.autoencoder = autoencoder
         self.t5_encoder = t5_encoder
         self.clip_encoder = clip_encoder
+        self.dump_folder = dump_folder
 
     @torch.no_grad()
     def validate(
@@ -112,61 +152,70 @@ class FluxValidator(Validator):
         model = model_parts[0]
         model.eval()
 
-        # Disable cfg dropout during validation
-        # pyrefly: ignore [missing-attribute]
-        training_cfg_prob = self.job_config.training.classifier_free_guidance_prob
-        # pyrefly: ignore [missing-attribute]
-        self.job_config.training.classifier_free_guidance_prob = 0.0
-
-        # pyrefly: ignore [missing-attribute]
-        save_img_count = self.job_config.validation.save_img_count
+        assert isinstance(self.config, FluxValidator.Config)
+        max_saved_images = self.config.save_img_count
+        image_idx = 0
 
         parallel_dims = self.parallel_dims
 
-        accumulated_losses = []
+        accumulated_loss: torch.Tensor | None = None
         device_type = dist_utils.device_type
+        total_local_elements = torch.zeros((), dtype=torch.int64, device=device_type)
         num_steps = 0
 
-        for input_dict, labels in self.validation_dataloader:
-            if (
-                self.job_config.validation.steps != -1
-                and num_steps >= self.job_config.validation.steps
-            ):
+        validation_dataloader = self.dl_config.build(
+            dp_world_size=self.dp_world_size,
+            dp_rank=self.dp_rank,
+            tokenizer=self.tokenizer,
+            max_context_length=self.seq_len,
+            num_tokens_per_batch=self.num_tokens_per_batch,
+        )
+
+        for input_dict in iterate_and_close_dataloader(validation_dataloader):
+            if self.config.steps != -1 and num_steps >= self.config.steps:
                 break
 
+            labels = input_dict.pop("labels")
             prompt = input_dict.pop("prompt")
             if not isinstance(prompt, list):
                 prompt = [prompt]
+            img_height, img_width = labels.shape[-2:]
             for p in prompt:
                 assert isinstance(p, str), f"prompt must be a string, got {type(p)}"
-                if save_img_count != -1 and save_img_count <= 0:
+                if max_saved_images != -1 and image_idx >= max_saved_images:
                     break
                 image = generate_image(
                     device=self.device,
                     dtype=self._dtype,
-                    job_config=self.job_config,
+                    img_height=img_height,
+                    img_width=img_width,
+                    enable_classifier_free_guidance=self.config.sampling.enable_classifier_free_guidance,
+                    denoising_steps=self.config.sampling.denoising_steps,
+                    classifier_free_guidance_scale=self.config.sampling.classifier_free_guidance_scale,
                     # pyrefly: ignore [bad-argument-type]
                     model=model,
                     prompt=p,
                     autoencoder=self.autoencoder,
-                    t5_tokenizer=self.t5_tokenizer,
-                    clip_tokenizer=self.clip_tokenizer,
+                    # pyrefly: ignore [bad-argument-type]
+                    tokenizer=self.tokenizer,
                     t5_encoder=self.t5_encoder,
                     clip_encoder=self.clip_encoder,
                 )
 
                 save_image(
-                    name=f"image_rank{str(torch.distributed.get_rank())}_{step}.png",
+                    name=(
+                        f"image_rank{torch.distributed.get_rank()}_step{step}_"
+                        f"{image_idx:06d}.png"
+                    ),
                     output_dir=os.path.join(
-                        self.job_config.job.dump_folder,
-                        # pyrefly: ignore [missing-attribute]
-                        self.job_config.validation.save_img_folder,
+                        self.dump_folder,
+                        self.config.save_img_folder,
                     ),
                     x=image,
                     add_sampling_metadata=True,
                     prompt=p,
                 )
-                save_img_count -= 1
+                image_idx += 1
 
             # generate t5 and clip embeddings
             input_dict["image"] = labels
@@ -196,6 +245,9 @@ class FluxValidator(Validator):
                 labels = labels.repeat_interleave(8, dim=0)
             else:
                 stratified_timesteps = input_dict.pop("timestep")
+
+            # Count full latent elements before CP shards the sequence.
+            total_local_elements += labels.numel()
 
             # Note the tps may be inaccurate due to the generating image step not being counted
             self.metrics_processor.ntokens_since_last_log += labels.numel()
@@ -236,73 +288,52 @@ class FluxValidator(Validator):
                     (latents, latent_pos_enc, t5_encodings, text_pos_enc, target),
                     None,  # No attention masks for Flux
                     load_balancer_type=None,
+                    input_seq_dims=1,
                 )
 
             with self.validation_context():
-                with self.maybe_enable_amp:
-                    latent_noise_pred = model(
-                        img=latents,
-                        img_ids=latent_pos_enc,
-                        txt=t5_encodings,
-                        txt_ids=text_pos_enc,
-                        y=clip_encodings,
-                        timesteps=timesteps,
-                    )
+                latent_noise_pred = model(
+                    img=latents,
+                    img_ids=latent_pos_enc,
+                    txt=t5_encodings,
+                    txt_ids=text_pos_enc,
+                    y=clip_encodings,
+                    timesteps=timesteps,
+                )
 
-                loss = self.loss_fn(latent_noise_pred, target)
+                loss, _ = self.loss_fn(latent_noise_pred, target)
 
             del noise, target, latent_noise_pred, latents
 
-            accumulated_losses.append(loss.detach())
+            loss = loss.detach()
+            if accumulated_loss is None:
+                accumulated_loss = loss.clone()
+            else:
+                accumulated_loss.add_(loss)
 
             num_steps += 1
 
-        # Compute average loss
-        loss = torch.sum(torch.stack(accumulated_losses))
-        loss /= num_steps
-        if parallel_dims.dp_cp_enabled:
-            global_avg_loss = dist_utils.dist_mean(
-                loss, parallel_dims.get_optional_mesh("loss")
+        assert accumulated_loss is not None
+
+        # CP ranks shard the same full latent tensor, so only DP contributes
+        # additional elements to the denominator.
+        if parallel_dims.dp_enabled:
+            total_global_elements = dist_utils.dist_sum_tensor(
+                total_local_elements, parallel_dims.get_mesh("batch")
             )
         else:
-            global_avg_loss = loss.item()
+            total_global_elements = total_local_elements
+
+        if parallel_dims.dp_cp_enabled:
+            global_loss_sum = dist_utils.dist_sum(
+                accumulated_loss, parallel_dims.get_optional_mesh("loss")
+            )
+        else:
+            global_loss_sum = float(accumulated_loss.item())
+
+        global_avg_loss = global_loss_sum / int(total_global_elements.item())
 
         self.metrics_processor.log_validation(loss=global_avg_loss, step=step)
 
         # Set model back to train mode
         model.train()
-
-        # re-enable cfg dropout for training
-        # pyrefly: ignore [missing-attribute]
-        self.job_config.training.classifier_free_guidance_prob = training_cfg_prob
-
-
-def build_flux_validator(
-    job_config: JobConfig,
-    dp_world_size: int,
-    dp_rank: int,
-    tokenizer: BaseTokenizer,
-    parallel_dims: ParallelDims,
-    loss_fn: LossFunction,
-    validation_context: ValidationContext,
-    maybe_enable_amp: AbstractContextManager[None],
-    metrics_processor: MetricsProcessor | None = None,
-    pp_schedule: _PipelineSchedule | None = None,
-    pp_has_first_stage: bool | None = None,
-    pp_has_last_stage: bool | None = None,
-) -> FluxValidator:
-    """Build a simple validator focused on correctness."""
-    return FluxValidator(
-        job_config=job_config,
-        dp_world_size=dp_world_size,
-        dp_rank=dp_rank,
-        tokenizer=tokenizer,
-        parallel_dims=parallel_dims,
-        loss_fn=loss_fn,
-        validation_context=validation_context,
-        maybe_enable_amp=maybe_enable_amp,
-        metrics_processor=metrics_processor,
-        pp_schedule=pp_schedule,
-        pp_has_first_stage=pp_has_first_stage,
-        pp_has_last_stage=pp_has_last_stage,
-    )

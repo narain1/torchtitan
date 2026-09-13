@@ -8,16 +8,15 @@ import json
 import logging
 import os
 import re
-
 from collections import defaultdict
 from typing import Any
 
 import torch
 from torchtitan.protocols.state_dict_adapter import StateDictAdapter
 
-from .args import FluxModelArgs
+from .model import FluxModel
 
-logger = logging.getLogger()
+logger = logging.getLogger(__name__)
 
 
 class FluxStateDictAdapter(StateDictAdapter):
@@ -28,8 +27,8 @@ class FluxStateDictAdapter(StateDictAdapter):
     This state dict adapter handles only the state dict of transformer from Flux HF model repo.
     """
 
-    def __init__(self, model_args: FluxModelArgs, hf_assets_path: str | None):
-        super().__init__(model_args, hf_assets_path)
+    def __init__(self, model_config: FluxModel.Config, hf_assets_path: str | None):
+        super().__init__(model_config, hf_assets_path)
         # Build fqn to index mapping if hf_assets_path
         if hf_assets_path:
             # If directory is multimodal ensure that hf_assets_path is to the folder containing transformer's safetensors
@@ -64,7 +63,7 @@ class FluxStateDictAdapter(StateDictAdapter):
             else:
                 self.fqn_to_index_mapping = None
 
-        self.model_args = model_args
+        self.model_config = model_config
         self.hf_assets_path = hf_assets_path
 
         # mapping containing direct 1 to 1 mappings from HF to torchtitan
@@ -204,13 +203,16 @@ class FluxStateDictAdapter(StateDictAdapter):
                     "single_blocks.{}.linear1.bias",
                     "single_blocks.{}.linear1.weight",
                 ]:
+                    # pyrefly: ignore [missing-attribute]
+                    hidden_size = self.model_config.hidden_size
                     mlp_hidden_dim = int(
-                        self.model_args.hidden_size * self.model_args.mlp_ratio
+                        hidden_size
+                        * self.model_config.mlp_ratio  # pyrefly: ignore [missing-attribute]
                     )
                     split_plan = [
-                        self.model_args.hidden_size,
-                        self.model_args.hidden_size,
-                        self.model_args.hidden_size,
+                        hidden_size,
+                        hidden_size,
+                        hidden_size,
                         mlp_hidden_dim,
                     ]
                     # split into q, k, v, mlp
@@ -221,7 +223,11 @@ class FluxStateDictAdapter(StateDictAdapter):
                     )
                 else:
                     # split into q, k, v
-                    split_vals = torch.split(value, self.model_args.hidden_size, dim=0)
+                    split_vals = torch.split(
+                        value,
+                        self.model_config.hidden_size,  # pyrefly: ignore [missing-attribute]
+                        dim=0,
+                    )
 
                 new_keys = (
                     abstract_key.format(layer_num)

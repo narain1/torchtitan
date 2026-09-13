@@ -4,27 +4,35 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from __future__ import annotations
+
 import contextlib
+import logging
 import math
 import os
 from abc import abstractmethod
 from collections.abc import Iterable
 from datetime import timedelta
-from typing import Protocol
+from typing import Protocol, TYPE_CHECKING
 
 import torch
 import torch.distributed._functional_collectives as funcol
 import torch.distributed.distributed_c10d as c10d
 import torch.distributed.tensor._random
 import torch.distributed.tensor.parallel
+from spmd_types.checker import typecheck as spmd_typecheck
 from torch import distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
-from torchtitan.config import Comm as CommConfig, Debug as DebugConfig, TORCH_DTYPE_MAP
-from torchtitan.distributed.parallel_dims import ParallelDims
-from torchtitan.tools.logging import logger
+from torchtitan.config import CommConfig, DebugConfig
 from torchtitan.tools.utils import device_module, device_type
+
+logger = logging.getLogger(__name__)
+
+
+if TYPE_CHECKING:
+    from torchtitan.distributed.parallel_dims import ParallelDims
 
 
 def _dist_reduce(
@@ -44,18 +52,24 @@ def _dist_reduce(
             Defaults to None. If provided, this all_reduce will be called for the extra
             process group, and then the result will be all_reduced for the mesh.
     """
-    if isinstance(x, DTensor):
-        # functional collectives do not support DTensor inputs
-        x = x.full_tensor()
+    return float(_dist_reduce_tensor(x, reduceOp, mesh, extra_pg).item())
 
+
+def _dist_reduce_tensor(
+    x: torch.Tensor,
+    reduceOp: str,
+    mesh: DeviceMesh | None,
+    extra_pg: dist.ProcessGroup | None,
+) -> torch.Tensor:
+    """Perform a distributed reduction without moving the result to the CPU."""
+    needs_wait = False
     if extra_pg is not None:
         x = funcol.all_reduce(x, reduceOp=reduceOp, group=extra_pg)
-
-    if mesh is None:
-        return x.item()
-
-    assert x.numel() == 1  # required by `.item()`
-    return funcol.all_reduce(x, reduceOp=reduceOp, group=mesh).item()
+        needs_wait = True
+    if mesh is not None:
+        x = funcol.all_reduce(x, reduceOp=reduceOp, group=mesh)
+        needs_wait = True
+    return funcol.wait_tensor(x) if needs_wait else x
 
 
 # TODO: rename this to maybe_dist_max
@@ -79,6 +93,17 @@ def dist_sum(
     )
 
 
+def dist_sum_tensor(
+    x: torch.Tensor,
+    mesh: DeviceMesh | None = None,
+    extra_pg: dist.ProcessGroup | None = None,
+) -> torch.Tensor:
+    """Sum a tensor across process groups and keep the result on its device."""
+    return _dist_reduce_tensor(
+        x, reduceOp=c10d.ReduceOp.SUM.name, mesh=mesh, extra_pg=extra_pg
+    )
+
+
 def dist_mean(
     x: torch.Tensor,
     mesh: DeviceMesh | None = None,
@@ -96,12 +121,13 @@ def set_determinism(
     distinct_seed_mesh_dims: list[str],
 ) -> None:
     """
-    Set the same DTensor manual seed for all dimensions in world mesh, but only different seeds
-    across dimensions denoted by `distinct_seed_mesh_dims`. An example use case is pipeline parallelism,
-    where we want to have the same seed across SPMD groups, but different seeds across PP groups.
+    Set the same distributed RNG seed for all axes in the world mesh, but use
+    different seeds across axes named by ``distinct_seed_mesh_dims``. For
+    example, pipeline stages should use different seeds while ranks within an
+    SPMD group use the same seed.
 
-    Currently, does not set seeds for the CUDA RNG since TorchTitan always uses DTensor for SPMD parallelisms,
-    and DTensor manages its own RNG tracker, but we could extend to support both if needed.
+    This uses PyTorch's DTensor RNG tracker because it provides mesh-aware RNG
+    offsets for sharded parameter initialization.
 
     Set Determinism flags for increased reproducibility with loss of performance.
 
@@ -113,23 +139,53 @@ def set_determinism(
     """
     if debug_config.deterministic:
         logger.info("Deterministic algorithm enabled (expect perf degradation).")
-        torch.use_deterministic_algorithms(True)
         torch.use_deterministic_algorithms(
             True, warn_only=debug_config.deterministic_warn_only
         )
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+        # use_deterministic_algorithms(True) enables fill_uninitialized_memory,
+        # which makes torch.empty() run a fill kernel. This kernel races with
+        # DeepEP comm streams, causing errors.
+        # This also prevents HF modeling from initializing ROPE (inv_freq) buffers to NaN.
+        # pyrefly: ignore [missing-attribute]
+        torch.utils.deterministic.fill_uninitialized_memory = False
         # env var for deterministic CuBLAS
         # https://pytorch.org/docs/stable/generated/torch.use_deterministic_algorithms.html
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
-        # Ensure flex_attention is compiled without max-autotune. This is needed to ensure
-        # reproducibility, since the autotune results may not be deterministic.
         from torch.nn.attention.flex_attention import flex_attention
 
-        from torchtitan.models.attention import FlexAttentionWrapper
+        from torchtitan.models.common.attention import FlexInnerAttention
 
-        FlexAttentionWrapper._compiled_flex_attn = torch.compile(flex_attention)
+        if torch.version.hip is not None:
+            # Compiled ROCm flex attention is not deterministic.
+            # Falling back to eager (non-compiled) flex_attention for determinism on ROCm.
+            logger.info(
+                "Using eager (non-compiled) flex_attention for determinism on ROCm."
+            )
+            FlexInnerAttention._compiled_flex_attn = flex_attention
+        else:
+            # Ensure flex_attention is compiled without max-autotune. This is needed to ensure
+            # reproducibility, since the autotune results may not be deterministic. We disable
+            # autotune in-place on FlexInnerAttention.inductor_configs (rather than recompiling with
+            # no options) so the regional-inductor scoop configs are preserved.
+            FlexInnerAttention.inductor_configs["max_autotune"] = False
+            FlexInnerAttention.inductor_configs["coordinate_descent_tuning"] = False
+            # pyrefly: ignore [no-matching-overload]
+            FlexInnerAttention._compiled_flex_attn = torch.compile(
+                flex_attention, options=FlexInnerAttention.inductor_configs
+            )
+
+    if debug_config.detect_anomaly:
+        logger.warning(
+            "Anomaly detection enabled. This incurs significant overhead "
+            "and is for debugging only."
+        )
+        # check_nan=False disables the NaN/Inf gradient check that internally calls
+        # aten._is_any_true, which has no DTensor sharding strategy and would crash.
+        # Stack trace recording (the useful part) is still enabled.
+        torch.autograd.set_detect_anomaly(True, check_nan=False)
 
     seed = debug_config.seed
     if parallel_dims.world_size == 1:
@@ -197,94 +253,162 @@ def set_determinism(
         torch.distributed.tensor._random.manual_seed(seed, parallel_dims.world_mesh)
 
 
-def create_context_parallel_ctx(
-    cp_mesh: DeviceMesh,
-    cp_buffers: list[torch.Tensor],
-    cp_seq_dims: list[int],
-    cp_no_restore_buffers: set[torch.Tensor],
-    cp_rotate_method: str,
-):
-    try:
-        from torch.distributed.tensor.experimental import context_parallel
-        from torch.distributed.tensor.experimental._attention import set_rotate_method
-    except ImportError as e:
-        raise ValueError(
-            f"PyTorch version {torch.__version__} does not include the experimental "
-            "Context Parallel API. Please update to a newer version."
-        ) from e
+_batch_invariant_enabled: bool = False
 
-    set_rotate_method(cp_rotate_method)
-    return context_parallel(
-        cp_mesh,
-        buffers=cp_buffers,
-        buffer_seq_dims=cp_seq_dims,
-        no_restore_buffers=cp_no_restore_buffers,
+
+def is_in_batch_invariant_mode() -> bool:
+    """Return whether batch-invariant mode is active."""
+    return _batch_invariant_enabled
+
+
+def enable_fp32_matmul_emulation_with_bf16x9() -> None:
+    """Enable BF16x9 emulation for FP32 CUDA matmuls where supported."""
+    if (
+        device_type != "cuda"
+        or not torch.cuda.is_available()
+        or torch.version.hip is not None
+        or torch.cuda.get_device_capability() < (10, 0)
+    ):
+        return
+
+    try:
+        torch.backends.cuda.matmul.fp32_precision = "bfx9"
+    except (AttributeError, RuntimeError, ValueError) as exc:
+        raise ValueError(
+            "TorchTitan on NVIDIA GPUs with compute capability 10.0 or later "
+            "requires PyTorch with CUDA BFX9 matmul support "
+            "(pytorch/pytorch#195301) and CUDA 12.9 or later."
+        ) from exc
+
+    logger.info("Enabled BF16x9 emulation for FP32 CUDA matmuls")
+
+
+def set_batch_invariance(enable: bool) -> None:
+    """Enable batch-invariant mode for reproducible RL training.
+
+    Delegates ATen operator overrides (``mm``, ``addmm``, ``_log_softmax``,
+    ``mean.dim``) to the ``batch_invariant_ops`` package, which registers
+    Triton kernels with a fixed tile iteration order producing bit-identical
+    results for the same input regardless of batch composition.
+
+    On top of that, this function applies torchtitan-specific settings:
+    - NCCL env vars for deterministic inter-GPU collectives
+    - Disables reduced-precision reductions and TF32
+
+    Note: callers must set ``debug.deterministic=True`` separately.
+    """
+    global _batch_invariant_enabled
+    if not enable or _batch_invariant_enabled:
+        return
+
+    # Register batch-invariant ATen overrides via upstream package
+    # https://github.com/thinking-machines-lab/batch_invariant_ops
+    from batch_invariant_ops import enable_batch_invariant_mode as _upstream_enable
+
+    _upstream_enable()
+
+    # Set NCCL env vars for deterministic inter-GPU collectives.
+    # Must be set BEFORE dist.init_process_group.
+    # Reference: https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/determinism/batch_invariant.py
+    os.environ["NCCL_LAUNCH_MODE"] = "GROUP"  # Fixed kernel launch ordering
+    os.environ[
+        "NCCL_COLLNET_ENABLE"
+    ] = "0"  # Disable SHARP (non-deterministic IB HW reduce)
+    os.environ[
+        "NCCL_NVLS_ENABLE"
+    ] = "0"  # Disable NVLink SHARP (non-deterministic NVSwitch HW reduce)
+    os.environ[
+        "NCCL_P2P_NET_DISABLE"
+    ] = "1"  # Disable P2P to avoid transport-dependent accumulation order
+    os.environ[
+        "NCCL_MIN_NCHANNELS"
+    ] = "1"  # Single channel to prevent split-interleave reordering
+    os.environ[
+        "NCCL_MAX_NCHANNELS"
+    ] = "1"  # Single channel to prevent split-interleave reordering
+    os.environ["NCCL_PROTO"] = "Simple"  # LL/LL128 protocols may reorder reductions
+    os.environ[
+        "NCCL_ALGO"
+    ] = "allreduce:tree"  # Deterministic reduction order across ranks
+    os.environ[
+        "NCCL_NTHREADS"
+    ] = "1"  # Single thread to eliminate scheduling non-determinism
+    os.environ[
+        "NCCL_SOCKET_NTHREADS"
+    ] = "1"  # Single socket thread to eliminate scheduling non-determinism
+
+    # Disable reduced-precision reductions: these allow cuBLAS to use
+    # lower-precision accumulation that can round differently depending
+    # on batch size / tile decomposition.
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+
+    # Disable TF32 for exact fp32 accumulation
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+
+    _batch_invariant_enabled = True
+
+    logger.info(
+        "Batch-invariant mode enabled: mm, addmm, _log_softmax, mean.dim "
+        "overridden with Triton kernels (via batch_invariant_ops); "
+        "reduced-precision reductions and TF32 disabled"
     )
 
 
-class TrainContext(Protocol):
+class SpmdContext(Protocol):
     @abstractmethod
     def __call__(self) -> contextlib.AbstractContextManager[None]:
         pass
 
 
-def get_train_context(enable_loss_parallel: bool) -> TrainContext:
+def get_spmd_context(
+    *,
+    parallel_dims: "ParallelDims | None" = None,
+    spmd_typechecking: bool = False,
+) -> SpmdContext:
     @contextlib.contextmanager
     def context():
         with contextlib.ExitStack() as stack:
-            if enable_loss_parallel:
-                stack.enter_context(torch.distributed.tensor.parallel.loss_parallel())
+            if parallel_dims is not None:
+                if not parallel_dims._single_axis_meshes:
+                    parallel_dims.build_mesh()
+                from torchtitan.distributed.spmd_types import (
+                    set_current_spmd_mesh,
+                    set_spmd_meshes,
+                    spmd_dense_mesh,
+                )
+
+                set_spmd_meshes(
+                    dense_mesh=parallel_dims.spmd_dense_mesh(),
+                    sparse_mesh=parallel_dims.spmd_sparse_mesh(),
+                )
+
+                stack.enter_context(set_current_spmd_mesh(spmd_dense_mesh()))
+            if spmd_typechecking:
+                stack.enter_context(spmd_typecheck(local=False))
 
             yield
 
     return context
 
 
-def maybe_enable_amp(
-    parallel_dims: ParallelDims, mixed_precision_param: str, device_type: str
-) -> contextlib.AbstractContextManager[None] | torch.autocast:
-    if parallel_dims.fsdp_enabled:
-        # FSDP handles mixed precision internally
-        logger.info("Mixed precision training is handled by fully_shard")
-        return contextlib.nullcontext()
-    else:
-        if parallel_dims.tp_enabled or parallel_dims.pp_enabled:
-            logger.warning(
-                "Mixed precision training with TP or PP is only supported when FSDP/HSDP/CP is enabled."
-            )
-            logger.info("Mixed precision training is disabled")
-            return contextlib.nullcontext()
-        else:
-            # the following code will only be executed for DDP or single-device training
-            logger.info("Mixed precision training is handled by AMP")
-            return torch.autocast(
-                device_type,
-                dtype=TORCH_DTYPE_MAP[mixed_precision_param],
-            )
-
-
-def init_fake_mode(world_size: int, comm_mode: str = "fake_backend"):
+def init_fake_mode(
+    world_size: int,
+    *,
+    rank: int = 0,
+) -> None:
     """Initialize fake backend
 
     Args:
         world_size: The number of GPUs to simulate
-        comm_mode: Communication mode ("fake_backend" or "local_tensor")
-
-    Returns:
-        The world size
+        rank: Global rank to simulate
     """
     torch.distributed.init_process_group(
         "fake",
-        rank=0,
+        rank=rank,
         world_size=world_size,
     )
-
-    # If local_tensor mode is enabled, initialize LocalTensorMode context
-    if comm_mode == "local_tensor":
-        from torch.distributed import _local_tensor
-
-        lm = _local_tensor.LocalTensorMode(world_size)
-        lm.__enter__()
 
 
 def init_distributed(
@@ -293,7 +417,22 @@ def init_distributed(
     base_folder: str = "",
     ranks: list[int] | None = None,
 ) -> int:
-    if comm_config.mode in ("fake_backend", "local_tensor"):
+    enable_fp32_matmul_emulation_with_bf16x9()
+
+    # Skip initialization if already initialized
+    if torch.distributed.is_initialized():
+        logger.warning(
+            "torch.distributed is already initialized. Skipping init_distributed. "
+            "The provided comm_config and other settings will not take effect."
+        )
+        return torch.distributed.get_world_size()
+
+    # disable autograd multithreading, to enable TLS DeviceMesh stack for spmd_types backend.
+    # this is needed for AC functionality; multi-threaded autograd means BWD threads performing recompute,
+    # cannot access PGs, e.g. current_spmd_mesh().get_group("tp") to perform the collectives they need.
+    torch.autograd.set_multithreading_enabled(False)
+
+    if comm_config.mode == "fake_backend":
         ngpu_str = os.environ.get("NGPU")
         if ngpu_str is None:
             raise ValueError(
@@ -305,7 +444,18 @@ def init_distributed(
             raise ValueError(
                 f"NGPU environment variable must be a valid integer, got: {ngpu_str}"
             ) from e
-        init_fake_mode(world_size, comm_config.mode)
+        rank_str = os.environ.get("RANK", "0")
+        try:
+            rank = int(rank_str)
+        except ValueError as e:
+            raise ValueError(
+                f"RANK environment variable must be a valid integer, got: {rank_str}"
+            ) from e
+        if not 0 <= rank < world_size:
+            raise ValueError(
+                f"RANK must be in [0, {world_size}) for fake mode, got: {rank}"
+            )
+        init_fake_mode(world_size, rank=rank)
         return world_size
 
     def _warn_overwrite_env(env, val):
@@ -384,7 +534,7 @@ def set_pg_timeouts(
         for mesh in parallel_dims.get_all_one_dimensional_meshes().values()
     ] + [None]
     for group in groups:
-        torch.distributed.distributed_c10d._set_pg_timeout(timeout, group)
+        torch.distributed.set_timeout(timeout, group)
 
 
 @torch.no_grad()

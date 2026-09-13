@@ -25,23 +25,22 @@ Example usages:
 
 2. Compare losses between two commits with custom config and options:
    loss_compare.py main my_branch \
-       --baseline-config='./custom.toml' \
+       --baseline-config='llama3_8b' \
        --baseline-options='--parallelism.tensor_parallel_degree=2' \
        --output-folder=my_comparison
 
-3. Compare commits with the same command but skip seed checkpoint for
+3. Compare losses between two commits using a different model module:
+   loss_compare.py main my_branch \
+       --baseline-module='qwen3' --baseline-config='qwen3_debugmodel'
+
+4. Compare commits with the same command but skip seed checkpoint for
    faster execution:
    loss_compare.py main my_branch --no-seed-checkpoint
 
-4. Compare the same commit with different training configurations:
+5. Compare the same commit with different training configurations:
    loss_compare.py . . \
        --baseline-options='--parallelism.dp=1' \
        --test-options='--parallelism.dp=2'
-
-5. Compare with different train files:
-   loss_compare.py main my_branch \
-       --baseline-train-file='torchtitan.train' \
-       --test-train-file='torchtitan.custom_train'
 
 6. Assert that losses are equal (for CI testing):
    loss_compare.py main my_branch --assert-equal
@@ -51,7 +50,7 @@ Example usages:
 
 8. Run baseline only with specific config and compare against imported losses:
    loss_compare.py . . --assert-equal --import-result=expected_losses.txt \
-       --baseline-config='./custom.toml'
+       --baseline-config='llama3_8b'
 
 9. Run baseline only and export the losses (no comparison):
    loss_compare.py . . --export-result=baseline_losses.txt
@@ -59,14 +58,21 @@ Example usages:
 10. Run baseline with specific options and export the losses:
     loss_compare.py . . --baseline-options='--parallelism.dp=2' \
         --export-result=my_config_losses.txt
+
+11. Use a model-equivalent config with a seed-safe optimizer only while
+    creating the model-only seed checkpoint:
+    loss_compare.py . . --baseline-module='my_module' \
+        --baseline-config='my_config' --seed-module='my_module' \
+        --seed-config='my_seed_config'
 """
 
 import argparse
 import os
-import re
+import shutil
 import subprocess
 import sys
 import unittest
+from collections.abc import Sequence
 from typing import Any
 
 # =============================================================================
@@ -75,8 +81,25 @@ from typing import Any
 
 LOG_PREFIX = "[LOSS_COMPARE]"
 
+# TensorBoard scalar tag for each metric name accepted by --metrics.
+TB_TAGS = {
+    "loss": "loss_metrics/global_avg_loss",
+    "grad_norm": "grad_norm",
+}
+DEFAULT_METRICS = ("loss",)
+
 # Fixed options that are always appended
-FIXED_OPTIONS = "--debug.deterministic --debug.seed=42"
+FIXED_OPTIONS = "--debug.deterministic --debug.seed=42 --metrics.enable_tensorboard --metrics.log_freq=1"
+SEED_PARALLELISM_OPTIONS = " ".join(
+    (
+        "--parallelism.data_parallel_replicate_degree=1",
+        "--parallelism.data_parallel_shard_degree=1",
+        "--parallelism.context_parallel_degree=1",
+        "--parallelism.tensor_parallel_degree=1",
+        "--parallelism.pipeline_parallel_degree=1",
+        "--parallelism.expert_parallel_degree=1",
+    )
+)
 
 
 # =============================================================================
@@ -99,34 +122,11 @@ def get_log_path(scenario: str, output_folder: str | None) -> str:
     return f"/tmp/{scenario}_training.log"
 
 
-def get_loss_file_path(scenario: str, output_folder: str) -> str:
-    """Get loss file path for a scenario."""
-    return f"{output_folder}/{scenario}_losses.txt"
-
-
-def get_clean_log_path(scenario: str, output_folder: str) -> str:
-    """Get cleaned log file path for a scenario."""
-    return f"{output_folder}/{scenario}_training_clean.log"
-
-
-def build_base_command(
-    config_file: str, train_file: str, options: str, job_dump_folder: str
-) -> str:
-    """Build the base command from config file, train file, and options."""
-    cmd = f"TRAIN_FILE='{train_file}' CONFIG_FILE='{config_file}' ./run_train.sh"
-    cmd += f" --job.dump_folder={job_dump_folder}"
-    if options:
-        cmd += f" {options}"
+def build_base_command(module: str, config: str, job_dump_folder: str) -> str:
+    """Build the base command from module and config."""
+    cmd = f"MODULE='{module}' CONFIG='{config}' ./run_train.sh"
+    cmd += f" --dump_folder={job_dump_folder}"
     return cmd
-
-
-def strip_ansi_codes(input_file: str, output_file: str) -> None:
-    """Strip ANSI escape codes from log files."""
-    ansi_escape = re.compile(r"\x1b\[[0-9;]*m")
-    with open(input_file, "r") as f_in:
-        with open(output_file, "w") as f_out:
-            for line in f_in:
-                f_out.write(ansi_escape.sub("", line))
 
 
 def run_with_realtime_output(cmd: str, logfile: str, env: dict[str, Any]) -> None:
@@ -160,6 +160,76 @@ def run_with_realtime_output(cmd: str, logfile: str, env: dict[str, Any]) -> Non
             raise subprocess.CalledProcessError(process.returncode, cmd)
 
 
+def extract_metrics_from_tensorboard(
+    job_dump_folder: str, tb_folder: str, metric_names: Sequence[str]
+) -> dict[str, dict[int, float]]:
+    """Extract full-precision values for each metric from TensorBoard events.
+
+    The TB directory is cleared before each run (see ``run_training``), so
+    there is exactly one timestamped subdirectory.  We find it and point
+    ``EventAccumulator`` at it directly.
+
+    Args:
+        job_dump_folder: The --job-dump-folder value (e.g., "outputs")
+        tb_folder: The TB subfolder name (e.g., "tb_baseline")
+        metric_names: Metric names to extract, each a key of ``TB_TAGS``
+
+    Returns:
+        Metric name -> {step number: full-precision value}.
+    """
+    return {
+        name: extract_scalar_from_tensorboard(job_dump_folder, tb_folder, TB_TAGS[name])
+        for name in metric_names
+    }
+
+
+def extract_scalar_from_tensorboard(
+    job_dump_folder: str,
+    tb_folder: str,
+    scalar_tag: str,
+) -> dict[int, float]:
+    """Extract one scalar tag from TensorBoard event files."""
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    base_path = os.path.join(job_dump_folder, tb_folder)
+    if not os.path.exists(base_path):
+        raise FileNotFoundError(f"TensorBoard path does not exist: {base_path}")
+
+    # Find the single timestamped subdirectory (e.g., "20260306-1618")
+    subdirs = [
+        d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))
+    ]
+    if len(subdirs) == 1:
+        event_dir = os.path.join(base_path, subdirs[0])
+    else:
+        # Should not happen since we clear the directory before each run
+        raise RuntimeError(
+            f"Expected exactly one subdirectory under {base_path}, "
+            f"found {len(subdirs)}: {subdirs}"
+        )
+
+    log_print(f"Loading TensorBoard events from: {event_dir}")
+
+    event_acc = EventAccumulator(event_dir)
+    event_acc.Reload()
+
+    available_tags = event_acc.Tags().get("scalars", [])
+
+    if scalar_tag not in available_tags:  # pyrefly: ignore [not-iterable]
+        raise KeyError(
+            f"Scalar tag '{scalar_tag}' not found in TensorBoard events. "
+            f"Available tags: {available_tags}"
+        )
+
+    scalars = event_acc.Scalars(scalar_tag)
+    values = {scalar.step: scalar.value for scalar in scalars}
+
+    log_print(
+        f"Extracted {len(values)} steps for '{scalar_tag}' from TensorBoard events"
+    )
+    return values
+
+
 def log_and_save(message: str, stats_file: str | None) -> None:
     """Output message to both stdout and stats file if provided."""
     print(message)
@@ -176,11 +246,11 @@ def log_and_save(message: str, stats_file: str | None) -> None:
 def validate_arguments(
     baseline_commit: str,
     test_commit: str,
+    baseline_module: str,
     baseline_config: str,
-    baseline_train_file: str,
     baseline_options: str,
+    test_module: str,
     test_config: str,
-    test_train_file: str,
     test_options: str,
     steps: int,
     assert_equal: bool,
@@ -196,11 +266,11 @@ def validate_arguments(
     # Validate that we are comparing different settings
     commits_differ = baseline_commit != test_commit
     configs_differ = baseline_config != test_config
-    train_files_differ = baseline_train_file != test_train_file
+    modules_differ = baseline_module != test_module
     options_differ = baseline_options != test_options
 
     all_identical = not (
-        commits_differ or configs_differ or train_files_differ or options_differ
+        commits_differ or configs_differ or modules_differ or options_differ
     )
 
     # Determine baseline-only mode:
@@ -220,8 +290,7 @@ def validate_arguments(
         log_print("Error: All settings are identical")
         log_print("       Cannot compare identical configurations")
         log_print(
-            "       Please provide different commits, configs, train files, "
-            "or options"
+            "       Please provide different commits, configs, modules, or options"
         )
         log_print(
             "       Or use --import-result with --assert-equal "
@@ -288,37 +357,48 @@ def setup_output_directory(output_folder: str | None) -> str | None:
 
 
 def build_training_command(
-    config_file: str,
-    train_file: str,
+    module: str,
+    config: str,
     options: str,
     steps: int,
     enable_seed_checkpoint: bool,
     job_dump_folder: str,
+    tb_folder: str = "tb",
 ) -> str:
-    """Build the final training command with all options."""
-    base_cmd = build_base_command(config_file, train_file, options, job_dump_folder)
-    cmd = f"{base_cmd} {FIXED_OPTIONS} --training.steps={steps}"
+    """Build the final training command with all options.
+
+    ``options`` goes last: a config-registry modifier such as
+    ``activation-checkpoint:none`` is a tyro subcommand, and every argument
+    after one is parsed inside that subcommand's namespace.
+    """
+    cmd = build_base_command(module, config, job_dump_folder)
+    cmd += f" {FIXED_OPTIONS} --training.steps={steps}"
+    cmd += f" --metrics.save_tb_folder={tb_folder}"
     if enable_seed_checkpoint:
         cmd += (
             " --checkpoint.enable --checkpoint.export_dtype=bfloat16"
             " --checkpoint.load_only"
         )
+    if options:
+        cmd += f" {options}"
     return cmd
 
 
 def print_configuration(
     baseline_commit: str,
     test_commit: str,
+    baseline_module: str,
     baseline_config: str,
-    baseline_train_file: str,
     baseline_options: str,
+    test_module: str,
     test_config: str,
-    test_train_file: str,
     test_options: str,
     steps: int,
     enable_seed_checkpoint: bool,
     job_dump_folder: str,
     baseline_only_mode: bool = False,
+    baseline_tb_folder: str = "tb_baseline",
+    test_tb_folder: str = "tb_test",
 ) -> None:
     """Print configuration summary."""
     if baseline_only_mode:
@@ -334,12 +414,13 @@ def print_configuration(
 
     # Build and display final commands
     baseline_final_cmd = build_training_command(
+        baseline_module,
         baseline_config,
-        baseline_train_file,
         baseline_options,
         steps,
         enable_seed_checkpoint,
         job_dump_folder,
+        tb_folder=baseline_tb_folder,
     )
 
     log_print("Baseline command:")
@@ -348,12 +429,13 @@ def print_configuration(
 
     if not baseline_only_mode:
         test_final_cmd = build_training_command(
+            test_module,
             test_config,
-            test_train_file,
             test_options,
             steps,
             enable_seed_checkpoint,
             job_dump_folder,
+            tb_folder=test_tb_folder,
         )
         log_print("Test command:")
         log_print(f"  {test_final_cmd}")
@@ -452,8 +534,8 @@ def restore_original_commit(original_commit: str) -> None:
 
 def create_seed_checkpoint(
     enable_seed_checkpoint: bool,
-    config_file: str,
-    train_file: str,
+    module: str,
+    config: str,
     output_folder: str | None,
     job_dump_folder: str,
 ) -> None:
@@ -464,10 +546,11 @@ def create_seed_checkpoint(
 
         # Build seed checkpoint command
         seed_cmd = (
-            f"TRAIN_FILE='{train_file}' CONFIG_FILE='{config_file}' "
-            f"./run_train.sh --job.dump_folder={job_dump_folder} "
+            f"MODULE='{module}' CONFIG='{config}' "
+            f"./run_train.sh --dump_folder={job_dump_folder} "
             f"--checkpoint.create_seed_checkpoint "
-            f"--checkpoint.enable {FIXED_OPTIONS}"
+            f"--checkpoint.enable --checkpoint.last_save_model_only "
+            f"{FIXED_OPTIONS} {SEED_PARALLELISM_OPTIONS}"
         )
 
         env = os.environ.copy()
@@ -478,14 +561,15 @@ def create_seed_checkpoint(
 
 def run_training(
     scenario: str,
-    config_file: str,
-    train_file: str,
+    module: str,
+    config: str,
     options: str,
     steps: int,
     enable_seed_checkpoint: bool,
     output_folder: str | None,
     job_dump_folder: str,
     ngpus: int,
+    tb_folder: str = "tb",
 ) -> str:
     """Run training for a specific scenario. Returns the log file path."""
     log_file = get_log_path(scenario, output_folder)
@@ -493,9 +577,21 @@ def run_training(
         f"Running training with {scenario} commit and logging output " f"to {log_file}"
     )
 
+    # Clear stale TensorBoard data so EventAccumulator only sees this run
+    tb_dir = os.path.join(job_dump_folder, tb_folder)
+    if os.path.exists(tb_dir):
+        log_print(f"Removing stale TensorBoard directory: {tb_dir}")
+        shutil.rmtree(tb_dir)
+
     # Build the final command
     full_cmd = build_training_command(
-        config_file, train_file, options, steps, enable_seed_checkpoint, job_dump_folder
+        module,
+        config,
+        options,
+        steps,
+        enable_seed_checkpoint,
+        job_dump_folder,
+        tb_folder=tb_folder,
     )
 
     env = os.environ.copy()
@@ -511,88 +607,82 @@ def run_training(
 # =============================================================================
 
 
-def extract_losses_from_log(log_file: str) -> dict[int, float]:
-    """Extract step and loss pairs from a log file."""
-    losses = {}
-    step_loss_pattern = re.compile(r"step:\s*(\d+)\s*loss:\s*(\d+\.\d+)")
-    ansi_escape = re.compile(r"\x1b\[[0-9;]*m")
+def read_metrics_from_file(result_file: str) -> dict[str, dict[int, float]]:
+    """Read a golden result file into metric name -> {step: value}.
 
-    with open(log_file, "r") as f:
+    The format is one row per step with one column per metric, preceded by
+    ``#`` comment lines. The comment line beginning ``# step`` names the
+    columns; a file without one is read as the historical ``<step> <loss>``
+    layout.
+    """
+    columns = ["step", "loss"]
+    rows: list[list[str]] = []
+    with open(result_file, "r") as f:
         for line in f:
-            # Strip ANSI codes before matching
-            clean_line = ansi_escape.sub("", line)
-            match = step_loss_pattern.search(clean_line)
-            if match:
-                step, loss = match.groups()
-                losses[int(step)] = float(loss)
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("#"):
+                fields = line.lstrip("#").split()
+                if fields and fields[0] == "step":
+                    columns = fields
+                continue
+            rows.append(line.split())
 
-    return losses
+    metric_names = columns[1:]
+    metrics: dict[str, dict[int, float]] = {name: {} for name in metric_names}
+    for row in rows:
+        if len(row) != len(columns):
+            raise ValueError(
+                f"{result_file}: expected {len(columns)} columns {columns}, "
+                f"found {len(row)}: {' '.join(row)}"
+            )
+        step = int(row[0])
+        for name, value in zip(metric_names, row[1:]):
+            metrics[name][step] = float(value)
+    return metrics
 
 
-def read_losses_from_file(loss_file: str) -> dict[int, float]:
-    """Read losses from a processed loss file."""
-    losses = {}
-    with open(loss_file, "r") as f:
-        for line in f:
-            step, loss = line.strip().split()
-            losses[int(step)] = float(loss)
-    return losses
+def export_metrics_to_file(
+    metrics: dict[str, dict[int, float]],
+    export_path: str,
+    config: str | None = None,
+    ngpus: int | None = None,
+) -> None:
+    """Write metrics to a golden result file and echo them to stdout.
 
-
-def export_losses_to_file(losses: dict[int, float], export_path: str) -> None:
-    """Export losses to file and stdout.
+    Uses repr() for float formatting to preserve full round-trip precision.
 
     Args:
-        losses: Dictionary mapping step numbers to loss values
+        metrics: Metric name -> {step number: value}
         export_path: Path to export file
+        config: Config the run used, recorded in the header
+        ngpus: World size the run used, recorded in the header
     """
-    log_print(f"Exporting losses to {export_path}")
+    log_print(f"Exporting metrics to {export_path}")
 
-    # Write to file and collect output for stdout
+    metric_names = list(metrics)
+    steps = sorted(metrics[metric_names[0]])
+    header = []
+    if config is not None:
+        header.append(f"# config: {config}")
+    if ngpus is not None:
+        header.append(f"# ngpu: {ngpus}")
+    header.append("# " + " ".join(["step", *metric_names]))
+    body = [
+        " ".join([str(step), *(repr(metrics[name][step]) for name in metric_names)])
+        for step in steps
+    ]
+
     with open(export_path, "w") as f:
-        for step in sorted(losses.keys()):
-            loss = losses[step]
-            line = f"{step} {loss}"
-            f.write(line + "\n")
+        f.write("\n".join([*header, *body]) + "\n")
 
-    log_print(f"Exported {len(losses)} loss values:")
+    log_print(f"Exported {len(steps)} steps for {', '.join(metric_names)}:")
     log_print()
-
-    # Output to stdout in same format
-    for step in sorted(losses.keys()):
-        loss = losses[step]
-        print(f"{step} {loss}")
-
+    for line in body:
+        print(line)
     log_print()
-    log_print(f"Losses saved to: {export_path}")
-
-
-def extract_loss_data(output_folder: str | None) -> None:
-    """Extract loss data from logs."""
-    if not output_folder:
-        return
-
-    log_print("Cleaning ANSI escape codes from log files...")
-
-    # Strip ANSI escape codes from log files before processing
-    scenarios = ["baseline", "test"]
-    for scenario in scenarios:
-        strip_ansi_codes(
-            get_log_path(scenario, output_folder),
-            get_clean_log_path(scenario, output_folder),
-        )
-
-    # Extract step and loss from cleaned logs
-    step_loss_pattern = re.compile(r"step:\s*(\d+)\s*loss:\s*(\d+\.\d+)")
-
-    for scenario in scenarios:
-        with open(get_clean_log_path(scenario, output_folder), "r") as f_in:
-            with open(get_loss_file_path(scenario, output_folder), "w") as f_out:
-                for line in f_in:
-                    match = step_loss_pattern.search(line)
-                    if match:
-                        step, loss = match.groups()
-                        f_out.write(f"{step} {loss}\n")
+    log_print(f"Results saved to: {export_path}")
 
 
 def generate_step_comparison(
@@ -657,7 +747,9 @@ def generate_summary_statistics(
 
 
 def perform_loss_analysis(
-    baseline_log: str, test_log: str, stats_file: str | None
+    baseline_losses: dict[int, float],
+    test_losses: dict[int, float],
+    stats_file: str | None,
 ) -> None:
     """Perform loss comparison analysis."""
     # Initialize stats file and add header
@@ -665,17 +757,12 @@ def perform_loss_analysis(
     log_and_save(f"{LOG_PREFIX} LOSS COMPARISON ANALYSIS", stats_file)
     log_and_save(f"{LOG_PREFIX} ==========================================", stats_file)
 
-    # Extract losses directly from log files
-    baseline_losses = extract_losses_from_log(baseline_log)
-    test_losses = extract_losses_from_log(test_log)
-
     # Check if losses were extracted successfully
     name_losses = [("baseline", baseline_losses), ("test", test_losses)]
     for name, losses in name_losses:
         if not losses:
             log_and_save(
-                f"{LOG_PREFIX} Warning: Could not extract loss data from "
-                f"{name} training log.",
+                f"{LOG_PREFIX} Warning: No loss data for {name}.",
                 stats_file,
             )
             log_and_save(
@@ -690,60 +777,70 @@ def perform_loss_analysis(
     generate_summary_statistics(baseline_losses, test_losses, stats_file)
 
 
-def assert_losses_equal(
-    baseline_log: str,
-    test_log: str | None = None,
+def assert_metrics_equal(
+    baseline_metrics: dict[str, dict[int, float]],
+    test_metrics: dict[str, dict[int, float]] | None = None,
     import_result: str | None = None,
 ) -> None:
-    """Assert that losses are equal between baseline and test using unittest.
-
-    Args:
-        baseline_log: Path to baseline training log file.
-        test_log: Path to test training log file. If None, only compares
-            baseline against imported losses (baseline-only mode).
-        import_result: Path to imported losses file for comparison.
-
-    In baseline-only mode (test_log is None), import_result must be provided.
-    """
-    log_print("Asserting losses are equal...")
-    log_print(f"Baseline log: {baseline_log}")
-    if test_log:
-        log_print(f"Test log: {test_log}")
-    else:
-        log_print("Test log: None (baseline-only mode)")
-    if import_result:
-        log_print(f"Import file: {import_result}")
-
-    # Validate baseline-only mode has import_result
-    if test_log is None and import_result is None:
+    """Assert every metric matches, against the test run and/or a golden file."""
+    imported_metrics = read_metrics_from_file(import_result) if import_result else None
+    if test_metrics is None and imported_metrics is None:
         log_print("Error: baseline-only mode requires --import-result")
         sys.exit(1)
 
-    # Extract losses from baseline log
-    baseline_losses = extract_losses_from_log(baseline_log)
-    log_print(f"Extracted {len(baseline_losses)} steps from baseline log")
+    for name, baseline in baseline_metrics.items():
+        for other_name, other in (
+            ("test", test_metrics),
+            ("imported", imported_metrics),
+        ):
+            if other is None:
+                continue
+            if name not in other:
+                log_print(f"Error: metric '{name}' missing from {other_name} results")
+                sys.exit(1)
+        assert_losses_equal(
+            baseline,
+            None if test_metrics is None else test_metrics[name],
+            None if imported_metrics is None else imported_metrics[name],
+            metric_name=name,
+        )
+
+
+def assert_losses_equal(
+    baseline_losses: dict[int, float],
+    test_losses: dict[int, float] | None = None,
+    imported_losses: dict[int, float] | None = None,
+    metric_name: str = "loss",
+) -> None:
+    """Assert one metric is equal between baseline and test using unittest.
+
+    Args:
+        baseline_losses: Baseline values extracted from TensorBoard.
+        test_losses: Test values extracted from TensorBoard. If None, only
+            compares baseline against imported values (baseline-only mode).
+        imported_losses: Values read from a golden result file.
+        metric_name: Metric these values belong to, used in messages.
+    """
+    log_print(f"Asserting {metric_name} values are equal...")
+    log_print(f"Baseline: {len(baseline_losses)} steps")
+    if test_losses is not None:
+        log_print(f"Test: {len(test_losses)} steps")
+    else:
+        log_print("Test: None (baseline-only mode)")
+    if imported_losses is not None:
+        log_print(f"Imported: {len(imported_losses)} steps")
 
     if not baseline_losses:
-        log_print("Error: No losses found in baseline log")
+        log_print(f"Error: No {metric_name} values found in baseline")
         sys.exit(1)
 
-    # Extract losses from test log if provided
-    test_losses = None
-    if test_log:
-        test_losses = extract_losses_from_log(test_log)
-        log_print(f"Extracted {len(test_losses)} steps from test log")
-        if not test_losses:
-            log_print("Error: No losses found in test log")
-            sys.exit(1)
+    if test_losses is not None and not test_losses:
+        log_print(f"Error: No {metric_name} values found in test")
+        sys.exit(1)
 
-    # Load imported losses if provided
-    imported_losses = None
-    if import_result:
-        imported_losses = read_losses_from_file(import_result)
-        log_print(f"Loaded {len(imported_losses)} steps from import file")
-        if not imported_losses:
-            log_print("Error: No losses found in import file")
-            sys.exit(1)
+    if imported_losses is not None and not imported_losses:
+        log_print(f"Error: No {metric_name} values found in import file")
+        sys.exit(1)
 
     # Create a test case
     class LossEqualityTest(unittest.TestCase):
@@ -780,8 +877,8 @@ def assert_losses_equal(
                     self.assertEqual(
                         baseline_loss,
                         test_loss,
-                        f"Loss mismatch at step {step}: "
-                        f"baseline={baseline_loss}, test={test_loss}",
+                        f"{metric_name} mismatch at step {step}: "
+                        f"baseline={repr(baseline_loss)}, test={repr(test_loss)}",
                     )
 
                 # Compare baseline vs imported (if provided)
@@ -790,8 +887,9 @@ def assert_losses_equal(
                     self.assertEqual(
                         baseline_loss,
                         imported_loss,
-                        f"Loss mismatch at step {step}: "
-                        f"baseline={baseline_loss}, imported={imported_loss}",
+                        f"{metric_name} mismatch at step {step}: "
+                        f"baseline={repr(baseline_loss)}, "
+                        f"imported={repr(imported_loss)}",
                     )
 
     # Run the test
@@ -800,33 +898,31 @@ def assert_losses_equal(
     result = runner.run(suite)
 
     if not result.wasSuccessful():
-        log_print("Loss assertion failed!")
+        log_print(f"{metric_name} assertion failed!")
+        log_print()
+        log_print(
+            f"Actual baseline {metric_name} values (can be used to update the "
+            "import file if the change is expected):"
+        )
+        log_print(
+            "Note that you should verify the loss curve change is not a "
+            "regression first!!!"
+        )
+        for step in sorted(baseline_losses.keys()):
+            loss = baseline_losses[step]
+            print(f"{step} {repr(loss)}")
+        log_print()
         sys.exit(1)
     else:
-        if test_log and import_result:
+        if test_losses is not None and imported_losses is not None:
             log_print(
                 "All losses are equal (baseline, test, and imported). "
                 "Assertion passed!"
             )
-        elif test_log:
+        elif test_losses is not None:
             log_print("All losses are equal (baseline and test). Assertion passed!")
         else:
             log_print("All losses are equal (baseline and imported). Assertion passed!")
-
-
-def cleanup_temp_files(output_folder: str | None) -> None:
-    """Cleanup temporary files."""
-    if not output_folder:
-        return
-
-    scenarios = ["baseline", "test"]
-    for scenario in scenarios:
-        for temp_file in [
-            get_loss_file_path(scenario, output_folder),
-            get_clean_log_path(scenario, output_folder),
-        ]:
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
 
 
 # =============================================================================
@@ -890,7 +986,7 @@ def parse_arguments() -> argparse.Namespace:
 Examples:
   %(prog)s abc123 def456
   %(prog)s abc123 def456 --steps=200
-  %(prog)s abc123 def456 --baseline-config='./custom.toml' \\
+  %(prog)s abc123 def456 --baseline-config='llama3_8b' \\
       --baseline-options='--parallelism.tensor_parallel_degree=2' --steps=50
   %(prog)s abc123 def456 --no-seed-checkpoint
   %(prog)s . . --baseline-options='--parallelism.dp=1' \\
@@ -901,18 +997,34 @@ Examples:
     parser.add_argument("baseline_commit", help="Git commit hash for baseline")
     parser.add_argument("test_commit", help="Git commit hash for test")
     parser.add_argument(
+        "--baseline-module",
+        default="llama3",
+        help="Module name for baseline run (default: llama3)",
+    )
+    parser.add_argument(
+        "--test-module",
+        default="",
+        help="Module name for test run (default: uses baseline-module)",
+    )
+    parser.add_argument(
         "--baseline-config",
-        default="./torchtitan/models/llama3/train_configs/debug_model.toml",
-        help=(
-            "Config file for baseline run "
-            "(default: ./torchtitan/models/llama3/train_configs/"
-            "llama3_debug.toml)"
-        ),
+        default="llama3_debugmodel",
+        help="Config name for baseline run (default: llama3_debugmodel)",
     )
     parser.add_argument(
         "--test-config",
         default="",
-        help="Config file for test run (default: uses baseline-config)",
+        help="Config name for test run (default: uses baseline-config)",
+    )
+    parser.add_argument(
+        "--seed-module",
+        default="",
+        help="Module name for seed checkpoint creation (default: baseline-module)",
+    )
+    parser.add_argument(
+        "--seed-config",
+        default="",
+        help="Config name for seed checkpoint creation (default: baseline-config)",
     )
     parser.add_argument(
         "--baseline-options",
@@ -923,22 +1035,6 @@ Examples:
         "--test-options",
         default="",
         help="Additional CLI arguments for test run (default: empty)",
-    )
-    parser.add_argument(
-        "--baseline-train-file",
-        default="torchtitan.train",
-        help=(
-            "Train file (Python module path) for baseline run "
-            "(default: torchtitan.train)"
-        ),
-    )
-    parser.add_argument(
-        "--test-train-file",
-        default="",
-        help=(
-            "Train file (Python module path) for test run "
-            "(default: uses baseline-train-file)"
-        ),
     )
     parser.add_argument(
         "--steps",
@@ -965,6 +1061,14 @@ Examples:
         help=(
             "Assert that all losses are equal (for CI testing). "
             "Script exits with error if losses differ."
+        ),
+    )
+    parser.add_argument(
+        "--metrics",
+        default=",".join(DEFAULT_METRICS),
+        help=(
+            "Comma-separated metrics to compare, chosen from "
+            f"{sorted(TB_TAGS)} (default: {','.join(DEFAULT_METRICS)})."
         ),
     )
     parser.add_argument(
@@ -1006,11 +1110,17 @@ Examples:
     args = parser.parse_args()
 
     # Set default values if not provided
+    if not args.test_module:
+        args.test_module = args.baseline_module
+
     if not args.test_config:
         args.test_config = args.baseline_config
 
-    if not args.test_train_file:
-        args.test_train_file = args.baseline_train_file
+    if not args.seed_module:
+        args.seed_module = args.baseline_module
+
+    if not args.seed_config:
+        args.seed_config = args.baseline_config
 
     # Convert empty output_folder to None
     if not args.output_folder:
@@ -1030,28 +1140,30 @@ Examples:
 def run_scenario(
     scenario: str,
     commit: str,
-    config_file: str,
-    train_file: str,
+    module: str,
+    config: str,
     options: str,
     steps: int,
     enable_seed_checkpoint: bool,
     output_folder: str | None,
     job_dump_folder: str,
     ngpus: int,
+    tb_folder: str = "tb",
 ) -> str:
     """Run training for a specific scenario (baseline or test).
 
     Args:
         scenario: Name of the scenario ("baseline" or "test")
         commit: Git commit to checkout
-        config_file: Config file path
-        train_file: Train file (Python module path)
+        module: Module name (e.g., "llama3")
+        config: Config name (e.g., "llama3_debugmodel")
         options: Additional CLI options
         steps: Number of training steps
         enable_seed_checkpoint: Whether to use seed checkpoint
         output_folder: Output folder for results
         job_dump_folder: Job dump folder path
         ngpus: Number of GPUs to use
+        tb_folder: TensorBoard subfolder name for this scenario
 
     Returns:
         Path to the log file
@@ -1060,14 +1172,15 @@ def run_scenario(
 
     log_file = run_training(
         scenario,
-        config_file,
-        train_file,
+        module,
+        config,
         options,
         steps,
         enable_seed_checkpoint,
         output_folder,
         job_dump_folder,
         ngpus,
+        tb_folder=tb_folder,
     )
 
     return log_file
@@ -1080,11 +1193,11 @@ def main() -> None:
     baseline_only_mode = validate_arguments(
         args.baseline_commit,
         args.test_commit,
+        args.baseline_module,
         args.baseline_config,
-        args.baseline_train_file,
         args.baseline_options,
+        args.test_module,
         args.test_config,
-        args.test_train_file,
         args.test_options,
         args.steps,
         args.assert_equal,
@@ -1092,22 +1205,37 @@ def main() -> None:
         args.import_result,
     )
 
+    metric_names = [name.strip() for name in args.metrics.split(",") if name.strip()]
+    unknown = [name for name in metric_names if name not in TB_TAGS]
+    if unknown or "loss" not in metric_names:
+        raise ValueError(
+            f"--metrics must include 'loss' and only names in {sorted(TB_TAGS)}, "
+            f"got {args.metrics!r}"
+        )
+
     # Setup environment
     stats_file = setup_output_directory(args.output_folder)
     enable_seed_checkpoint = not args.no_seed_checkpoint
+
+    # Define per-scenario TensorBoard folder names
+    baseline_tb_folder = "tb_baseline"
+    test_tb_folder = "tb_test"
+
     print_configuration(
         args.baseline_commit,
         args.test_commit,
+        args.baseline_module,
         args.baseline_config,
-        args.baseline_train_file,
         args.baseline_options,
+        args.test_module,
         args.test_config,
-        args.test_train_file,
         args.test_options,
         args.steps,
         enable_seed_checkpoint,
         args.job_dump_folder,
         baseline_only_mode,
+        baseline_tb_folder=baseline_tb_folder,
+        test_tb_folder=test_tb_folder,
     )
 
     # Check if git working directory is clean before switching commits
@@ -1126,8 +1254,8 @@ def main() -> None:
     try:
         create_seed_checkpoint(
             enable_seed_checkpoint,
-            args.baseline_config,
-            args.baseline_train_file,
+            args.seed_module,
+            args.seed_config,
             args.output_folder,
             args.job_dump_folder,
         )
@@ -1135,54 +1263,74 @@ def main() -> None:
         baseline_log = run_scenario(
             "baseline",
             args.baseline_commit,
+            args.baseline_module,
             args.baseline_config,
-            args.baseline_train_file,
             args.baseline_options,
             args.steps,
             enable_seed_checkpoint,
             args.output_folder,
             args.job_dump_folder,
             args.baseline_ngpus,
+            tb_folder=baseline_tb_folder,
+        )
+
+        # Extract baseline metrics from TensorBoard (full precision)
+        baseline_metrics = extract_metrics_from_tensorboard(
+            args.job_dump_folder, baseline_tb_folder, metric_names
         )
 
         # Run test training (skip in baseline-only mode)
         test_log = None
+        test_metrics = None
         if not baseline_only_mode:
             test_log = run_scenario(
                 "test",
                 args.test_commit,
+                args.test_module,
                 args.test_config,
-                args.test_train_file,
                 args.test_options,
                 args.steps,
                 enable_seed_checkpoint,
                 args.output_folder,
                 args.job_dump_folder,
                 args.test_ngpus,
+                tb_folder=test_tb_folder,
+            )
+
+            # Extract test metrics from TensorBoard (full precision)
+            test_metrics = extract_metrics_from_tensorboard(
+                args.job_dump_folder, test_tb_folder, metric_names
             )
         log_print()
 
         # Assert losses are equal if requested
         if args.assert_equal:
-            # Pass test_log (None in baseline-only mode) and import_result
-            assert_losses_equal(baseline_log, test_log, args.import_result)
+            assert_metrics_equal(baseline_metrics, test_metrics, args.import_result)
 
-            # Export losses if requested (only after assertion passes)
+            # Export metrics if requested (only after assertion passes)
             if args.export_result:
-                # Extract baseline losses (they equal test losses since assertion passed)
-                baseline_losses = extract_losses_from_log(baseline_log)
-                export_losses_to_file(baseline_losses, args.export_result)
+                export_metrics_to_file(
+                    baseline_metrics,
+                    args.export_result,
+                    args.baseline_config,
+                    args.baseline_ngpus,
+                )
 
-        # Export losses in baseline-only mode without assertion
+        # Export metrics in baseline-only mode without assertion
         # (when --export-result is used with identical settings)
         if args.export_result and baseline_only_mode and not args.assert_equal:
-            baseline_losses = extract_losses_from_log(baseline_log)
-            export_losses_to_file(baseline_losses, args.export_result)
+            export_metrics_to_file(
+                baseline_metrics,
+                args.export_result,
+                args.baseline_config,
+                args.baseline_ngpus,
+            )
 
         # Analysis and reporting (skip in baseline-only mode as there's no test to compare)
-        if not baseline_only_mode and test_log is not None:
-            perform_loss_analysis(baseline_log, test_log, stats_file)
-            cleanup_temp_files(args.output_folder)
+        if not baseline_only_mode and test_metrics is not None:
+            perform_loss_analysis(
+                baseline_metrics["loss"], test_metrics["loss"], stats_file
+            )
         print_completion_summary(
             args.output_folder, enable_seed_checkpoint, baseline_only_mode
         )
